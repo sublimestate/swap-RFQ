@@ -10,6 +10,7 @@ import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeS
 import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
+import {IERC20} from "forge-std/interfaces/IERC20.sol";
 
 // Mock interfaces for Aave/Spark lending protocol for JIT Clawback
 interface ILendingPool {
@@ -108,8 +109,32 @@ contract IntentRFQHook is BaseHook {
     }
 
     function _settleWithSolver(PoolKey calldata key, SwapParams calldata params, SolverQuote memory quote) internal {
-        // Hook receives funds from User and sends to Solver, and vice versa
-        // Using poolManager.take() / settle() or direct ERC20 transfers
+        // Determine currencies
+        Currency currencyIn = params.zeroForOne ? key.currency0 : key.currency1;
+        Currency currencyOut = params.zeroForOne ? key.currency1 : key.currency0;
+
+        // If amountSpecified is negative, it's exactIn (user pays amountSpecified).
+        uint256 amountIn = params.amountSpecified < 0 ? uint256(-params.amountSpecified) : quote.amountIn;
+        uint256 amountOut = quote.amountOut;
+
+        // 1. Hook takes `amountIn` of currencyIn from PoolManager and gives it to the Solver.
+        // Since the PoolManager might not have the ERC20 tokens yet (as the router pays after swap),
+        // we mint ERC6909 claims to the solver which they can burn later.
+        poolManager.mint(quote.solver, currencyIn.toId(), amountIn);
+
+        // 2. Hook pulls `amountOut` of currencyOut from Solver to PoolManager.
+        // The solver must have approved this hook contract.
+        // We use IERC20 to transfer the tokens.
+        if (Currency.unwrap(currencyOut) != address(0)) {
+            IERC20(Currency.unwrap(currencyOut)).transferFrom(quote.solver, address(poolManager), amountOut);
+        } else {
+            // For native ETH, solver would need to send ETH directly to the PoolManager.
+            // Simplified for v1.0.
+        }
+
+        // 3. Settle the currencyOut with the PoolManager to clear the hook's debit.
+        poolManager.sync(currencyOut);
+        poolManager.settle();
     }
 
     function _checkLVRProtection(PoolKey calldata key) internal view {
