@@ -23,7 +23,7 @@ contract IntentRFQHookTest is Test, Deployers {
         // In a full environment, deploy the hook to an address matching its required flags
         // using HookMiner
         vm.etch(hookAddress, hex"00");
-        hook = new IntentRFQHook(manager, mockLendingPool);
+        hook = new IntentRFQHook(manager, mockLendingPool, address(0x456));
     }
 
     function test_Initialization() public {

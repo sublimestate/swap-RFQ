@@ -32,11 +32,15 @@ contract IntentRFQHook is BaseHook {
     // Scroll L1SLOAD precompile address mock
     address public constant L1_SLOAD_PRECOMPILE = 0x0000000000000000000000000000000000000101;
     
+    address public immutable l1PoolAddress;
+    uint256 public constant MAX_SQRT_PRICE_DEVIATION_BIPS = 25; // ~0.5% price deviation
+    
     error InvalidSignature();
     error LVRAttackDetected();
 
-    constructor(IPoolManager _poolManager, address _lendingPool) BaseHook(_poolManager) {
+    constructor(IPoolManager _poolManager, address _lendingPool, address _l1PoolAddress) BaseHook(_poolManager) {
         lendingPool = ILendingPool(_lendingPool);
+        l1PoolAddress = _l1PoolAddress;
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -149,15 +153,34 @@ contract IntentRFQHook is BaseHook {
     }
 
     function _checkLVRProtection(PoolKey calldata key) internal view {
+        if (l1PoolAddress == address(0)) return;
+
+        // Get the L2 AMM price
+        (uint160 sqrtPriceX96L2, , , ) = poolManager.getSlot0(key.toId());
+
         // Read L1 spot price via L1SLOAD precompile (mocked call)
-        // If difference between L2 AMM price and L1 spot price > threshold, revert
-        // For demonstration, we simply check the address format
         if (L1_SLOAD_PRECOMPILE.code.length > 0) {
-            (bool success, bytes memory data) = L1_SLOAD_PRECOMPILE.staticcall(abi.encodePacked(key.currency0));
-            if (success) {
-                uint256 l1Price = abi.decode(data, (uint256));
-                // LVR logic check
-                if (l1Price == 0) revert LVRAttackDetected();
+            (bool success, bytes memory data) = L1_SLOAD_PRECOMPILE.staticcall(
+                abi.encodePacked(l1PoolAddress, uint256(0))
+            );
+
+            if (success && data.length >= 32) {
+                uint256 slot0Data = abi.decode(data, (uint256));
+                // sqrtPriceX96 is the lowest 160 bits of Slot0
+                uint160 sqrtPriceX96L1 = uint160(slot0Data & 0x00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF);
+                
+                // Check discrepancy
+                if (sqrtPriceX96L1 > 0 && sqrtPriceX96L2 > 0) {
+                    uint256 diff = sqrtPriceX96L1 > sqrtPriceX96L2 
+                        ? sqrtPriceX96L1 - sqrtPriceX96L2 
+                        : sqrtPriceX96L2 - sqrtPriceX96L1;
+                    
+                    uint256 deviationBips = (diff * 10000) / sqrtPriceX96L2;
+                    
+                    if (deviationBips > MAX_SQRT_PRICE_DEVIATION_BIPS) {
+                        revert LVRAttackDetected();
+                    }
+                }
             }
         }
     }
