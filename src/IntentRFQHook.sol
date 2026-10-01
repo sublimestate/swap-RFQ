@@ -11,6 +11,8 @@ import {BalanceDelta} from "v4-core/src/types/BalanceDelta.sol";
 import {Currency, CurrencyLibrary} from "v4-core/src/types/Currency.sol";
 import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {IERC20} from "forge-std/interfaces/IERC20.sol";
+import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 
 // Mock interfaces for Aave/Spark lending protocol for JIT Clawback
 interface ILendingPool {
@@ -24,6 +26,8 @@ contract IntentRFQHook is BaseHook {
     using StateLibrary for IPoolManager;
 
     ILendingPool public immutable lendingPool;
+    
+    mapping(address => bool) public isAuthorizedSolver;
     
     // Scroll L1SLOAD precompile address mock
     address public constant L1_SLOAD_PRECOMPILE = 0x0000000000000000000000000000000000000101;
@@ -103,9 +107,16 @@ contract IntentRFQHook is BaseHook {
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function _verifySolverSignature(SolverQuote memory quote) internal pure returns (bool) {
-        // Mock verification logic
-        return quote.signature.length > 0;
+    function _verifySolverSignature(SolverQuote memory quote) internal view returns (bool) {
+        // Construct the message hash
+        bytes32 messageHash = keccak256(abi.encodePacked(quote.solver, quote.amountIn, quote.amountOut));
+        
+        // Recover the signer from the Ethereum signed message format
+        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(messageHash);
+        address recoveredSigner = ECDSA.recover(ethSignedMessageHash, quote.signature);
+        
+        // Verify the recovered signer matches the solver and is authorized
+        return recoveredSigner == quote.solver && isAuthorizedSolver[quote.solver];
     }
 
     function _settleWithSolver(PoolKey calldata key, SwapParams calldata params, SolverQuote memory quote) internal {
