@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import {BaseHook} from "@openzeppelin/uniswap-hooks/src/base/BaseHook.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
-import {IPoolManager, SwapParams} from "v4-core/src/interfaces/IPoolManager.sol";
+import {IPoolManager, SwapParams, ModifyLiquidityParams} from "v4-core/src/interfaces/IPoolManager.sol";
 import {PoolKey} from "v4-core/src/types/PoolKey.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/src/types/BeforeSwapDelta.sol";
@@ -185,17 +185,37 @@ contract IntentRFQHook is BaseHook {
         }
     }
 
+    int24 public constant CLAWBACK_TICK_LOWER = -60;
+    int24 public constant CLAWBACK_TICK_UPPER = 60;
+
     function _jitClawback(PoolKey calldata key, SwapParams calldata params) internal {
         // Calculate exact liquidity required for fallback
-        uint256 requiredLiquidity = uint256(params.amountSpecified > 0 ? params.amountSpecified : -params.amountSpecified);
+        uint256 requiredAmount = uint256(params.amountSpecified > 0 ? params.amountSpecified : -params.amountSpecified);
         
-        // Withdraw from lending pool
-        address tokenToWithdraw = params.zeroForOne ? Currency.unwrap(key.currency1) : Currency.unwrap(key.currency0);
+        // Identify which token the AMM needs for the user's exact input/output
+        address tokenToWithdraw = params.zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
         
-        // For actual ERC20 tokens, we would call the lending pool
         if (tokenToWithdraw != address(0)) {
-            // lendingPool.withdraw(tokenToWithdraw, requiredLiquidity, address(this));
-            // Add liquidity to Uniswap V4 Pool
+            // 1. Just-In-Time withdrawal from yield-generating protocol
+            lendingPool.withdraw(tokenToWithdraw, requiredAmount, address(this));
+            
+            // 2. Add liquidity to the Uniswap V4 Pool dynamically
+            // (Using requiredAmount as liquidityDelta for mock simplicity)
+            poolManager.modifyLiquidity(
+                key,
+                ModifyLiquidityParams({
+                    tickLower: CLAWBACK_TICK_LOWER,
+                    tickUpper: CLAWBACK_TICK_UPPER,
+                    liquidityDelta: int256(requiredAmount),
+                    salt: bytes32(0)
+                }),
+                new bytes(0)
+            );
+
+            // 3. Settle the newly added liquidity with the PoolManager
+            poolManager.sync(Currency.wrap(tokenToWithdraw));
+            IERC20(tokenToWithdraw).transfer(address(poolManager), requiredAmount);
+            poolManager.settle();
         }
     }
 
