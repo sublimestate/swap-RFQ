@@ -29,6 +29,8 @@ contract IntentRFQHook is BaseHook {
     
     mapping(address => bool) public isAuthorizedSolver;
     
+    mapping(address => uint256) public solverNonces;
+    
     // Scroll L1SLOAD precompile address mock
     address public constant L1_SLOAD_PRECOMPILE = 0x0000000000000000000000000000000000000101;
     
@@ -37,6 +39,8 @@ contract IntentRFQHook is BaseHook {
     
     error InvalidSignature();
     error LVRAttackDetected();
+    error SignatureExpired();
+    error InvalidNonce();
 
     constructor(IPoolManager _poolManager, address _lendingPool, address _l1PoolAddress) BaseHook(_poolManager) {
         lendingPool = ILendingPool(_lendingPool);
@@ -67,6 +71,8 @@ contract IntentRFQHook is BaseHook {
         address solver;
         uint256 amountIn;
         uint256 amountOut;
+        uint256 nonce;
+        uint256 deadline;
         bytes signature;
     }
 
@@ -111,9 +117,15 @@ contract IntentRFQHook is BaseHook {
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
-    function _verifySolverSignature(SolverQuote memory quote) internal view returns (bool) {
+    function _verifySolverSignature(SolverQuote memory quote) internal returns (bool) {
+        if (block.timestamp > quote.deadline) revert SignatureExpired();
+        if (quote.nonce != solverNonces[quote.solver]) revert InvalidNonce();
+
+        // Increment nonce
+        solverNonces[quote.solver]++;
+
         // Construct the message hash
-        bytes32 messageHash = keccak256(abi.encodePacked(quote.solver, quote.amountIn, quote.amountOut));
+        bytes32 messageHash = keccak256(abi.encodePacked(quote.solver, quote.amountIn, quote.amountOut, quote.nonce, quote.deadline));
         
         // Recover the signer from the Ethereum signed message format
         bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(messageHash);
@@ -223,6 +235,34 @@ contract IntentRFQHook is BaseHook {
     function toBeforeSwapDelta(int128 deltaUnspecified, int128 deltaSpecified) internal pure returns (BeforeSwapDelta delta) {
         assembly {
             delta := or(shl(128, deltaUnspecified), and(deltaSpecified, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF))
+        }
+    }
+
+    /// @notice Permissionless function to sweep idle liquidity from the AMM into the yield-generating protocol
+    function sweepIdleLiquidity(PoolKey calldata key, int24 tickLower, int24 tickUpper, uint256 liquidityToRemove) external {
+        // 1. Remove liquidity from Uniswap V4
+        (BalanceDelta delta, ) = poolManager.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: -int256(liquidityToRemove),
+                salt: bytes32(0)
+            }),
+            new bytes(0)
+        );
+
+        // 2. Take the withdrawn tokens from the PoolManager
+        if (delta.amount0() > 0) {
+            poolManager.take(key.currency0, address(this), uint256(uint128(delta.amount0())));
+            IERC20(Currency.unwrap(key.currency0)).approve(address(lendingPool), uint256(uint128(delta.amount0())));
+            lendingPool.supply(Currency.unwrap(key.currency0), uint256(uint128(delta.amount0())), address(this), 0);
+        }
+
+        if (delta.amount1() > 0) {
+            poolManager.take(key.currency1, address(this), uint256(uint128(delta.amount1())));
+            IERC20(Currency.unwrap(key.currency1)).approve(address(lendingPool), uint256(uint128(delta.amount1())));
+            lendingPool.supply(Currency.unwrap(key.currency1), uint256(uint128(delta.amount1())), address(this), 0);
         }
     }
 }
