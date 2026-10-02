@@ -45,8 +45,10 @@ We utilize `@openzeppelin/contracts` for `Ownable`, `ECDSA`, and `MessageHashUti
 
 ## 🚀 Next Priorities (If prompted to improve the repo)
 Check the **"Potential Additional Features"** section in `README.md`. High-leverage tasks include:
-1. Replacing OpenZeppelin `ECDSA` with raw inline assembly `ecrecover` for gas optimization.
-2. Transitioning the proprietary `SolverQuote` struct to EIP-712 Typed Data.
-3. Implementing yield harvesting (`harvestYield`) to claim accrued Aave interest.
+1. **Slippage Handling**: Upgrading the `beforeSwap` price check to account for curve depth and slippage instead of just comparing the raw spot price.
+2. **Aave 100% Utilization Fix**: Implementing a 5-10% "Idle Buffer" and `try/catch` logic so that extreme Aave borrowing doesn't cascade into reverting Uniswap trades.
+3. Replacing OpenZeppelin `ECDSA` with raw inline assembly `ecrecover` for gas optimization.
+4. Transitioning the proprietary `SolverQuote` struct to EIP-712 Typed Data.
+5. Implementing yield harvesting (`harvestYield`) to claim accrued Aave interest.
 
 **End of Context. Happy Coding!**
