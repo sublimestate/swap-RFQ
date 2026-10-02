@@ -13,23 +13,18 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {IERC20} from "forge-std/interfaces/IERC20.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
-
-// Mock interfaces for Aave/Spark lending protocol for JIT Clawback
-interface ILendingPool {
-    function withdraw(address asset, uint256 amount, address to) external returns (uint256);
-    function supply(address asset, uint256 amount, address onBehalfOf, uint16 referralCode) external;
-}
+import {IAaveV3Pool} from "./interfaces/IAaveV3Pool.sol";
 
 contract IntentRFQHook is BaseHook {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using StateLibrary for IPoolManager;
 
-    ILendingPool public immutable lendingPool;
+    IAaveV3Pool public immutable aavePool;
     
     mapping(address => bool) public isAuthorizedSolver;
-    
     mapping(address => uint256) public solverNonces;
+    mapping(address => bool) public isAaveApproved; // Tracks infinite approvals to save gas
     
     // Scroll L1SLOAD precompile address mock
     address public constant L1_SLOAD_PRECOMPILE = 0x0000000000000000000000000000000000000101;
@@ -42,8 +37,8 @@ contract IntentRFQHook is BaseHook {
     error SignatureExpired();
     error InvalidNonce();
 
-    constructor(IPoolManager _poolManager, address _lendingPool, address _l1PoolAddress) BaseHook(_poolManager) {
-        lendingPool = ILendingPool(_lendingPool);
+    constructor(IPoolManager _poolManager, address _aavePool, address _l1PoolAddress) BaseHook(_poolManager) {
+        aavePool = IAaveV3Pool(_aavePool);
         l1PoolAddress = _l1PoolAddress;
     }
 
@@ -209,7 +204,7 @@ contract IntentRFQHook is BaseHook {
         
         if (tokenToWithdraw != address(0)) {
             // 1. Just-In-Time withdrawal from yield-generating protocol
-            lendingPool.withdraw(tokenToWithdraw, requiredAmount, address(this));
+            aavePool.withdraw(tokenToWithdraw, requiredAmount, address(this));
             
             // 2. Add liquidity to the Uniswap V4 Pool dynamically
             // (Using requiredAmount as liquidityDelta for mock simplicity)
@@ -252,17 +247,31 @@ contract IntentRFQHook is BaseHook {
             new bytes(0)
         );
 
-        // 2. Take the withdrawn tokens from the PoolManager
+        // 2. Take the withdrawn tokens from the PoolManager and supply to Aave
         if (delta.amount0() > 0) {
-            poolManager.take(key.currency0, address(this), uint256(uint128(delta.amount0())));
-            IERC20(Currency.unwrap(key.currency0)).approve(address(lendingPool), uint256(uint128(delta.amount0())));
-            lendingPool.supply(Currency.unwrap(key.currency0), uint256(uint128(delta.amount0())), address(this), 0);
+            address token0 = Currency.unwrap(key.currency0);
+            uint256 amount0 = uint256(uint128(delta.amount0()));
+            
+            poolManager.take(key.currency0, address(this), amount0);
+            
+            if (!isAaveApproved[token0]) {
+                IERC20(token0).approve(address(aavePool), type(uint256).max);
+                isAaveApproved[token0] = true;
+            }
+            aavePool.supply(token0, amount0, address(this), 0);
         }
 
         if (delta.amount1() > 0) {
-            poolManager.take(key.currency1, address(this), uint256(uint128(delta.amount1())));
-            IERC20(Currency.unwrap(key.currency1)).approve(address(lendingPool), uint256(uint128(delta.amount1())));
-            lendingPool.supply(Currency.unwrap(key.currency1), uint256(uint128(delta.amount1())), address(this), 0);
+            address token1 = Currency.unwrap(key.currency1);
+            uint256 amount1 = uint256(uint128(delta.amount1()));
+            
+            poolManager.take(key.currency1, address(this), amount1);
+            
+            if (!isAaveApproved[token1]) {
+                IERC20(token1).approve(address(aavePool), type(uint256).max);
+                isAaveApproved[token1] = true;
+            }
+            aavePool.supply(token1, amount1, address(this), 0);
         }
     }
 }

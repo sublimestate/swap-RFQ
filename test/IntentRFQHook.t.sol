@@ -29,7 +29,7 @@ import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 
 contract IntentRFQHookTest is Test, Deployers {
     IntentRFQHookHarness public hook;
-    address public mockLendingPool = address(0x123);
+    address public mockAavePool = address(0x123);
     address public mockL1Pool = address(0x456);
 
     uint256 solverPrivateKey = 0xA11CE;
@@ -46,16 +46,16 @@ contract IntentRFQHookTest is Test, Deployers {
             address(this),
             flags,
             type(IntentRFQHookHarness).creationCode,
-            abi.encode(manager, mockLendingPool, mockL1Pool)
+            abi.encode(manager, mockAavePool, mockL1Pool)
         );
         
-        hook = new IntentRFQHookHarness{salt: salt}(manager, mockLendingPool, mockL1Pool);
+        hook = new IntentRFQHookHarness{salt: salt}(manager, mockAavePool, mockL1Pool);
         
         hook.setAuthorizedSolver(solverAddress, true);
     }
 
     function test_Initialization() public view {
-        assertEq(address(hook.lendingPool()), mockLendingPool);
+        assertEq(address(hook.aavePool()), mockAavePool);
     }
 
     function test_HookPermissions() public view {
