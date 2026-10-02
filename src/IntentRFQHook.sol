@@ -112,6 +112,8 @@ contract IntentRFQHook is BaseHook {
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
+    // TODO(Optimization): Replace OpenZeppelin ECDSA with raw inline assembly `ecrecover`
+    // to reduce gas overhead by ~12,000 units on the hot path since this executes pre-swap.
     function _verifySolverSignature(SolverQuote memory quote) internal returns (bool) {
         if (block.timestamp > quote.deadline) revert SignatureExpired();
         if (quote.nonce != solverNonces[quote.solver]) revert InvalidNonce();
