@@ -10,6 +10,8 @@ import {IntentRFQHook} from "../src/IntentRFQHook.sol";
 import {Deployers} from "v4-core/test/utils/Deployers.sol";
 
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
+import {PoolKey} from "v4-core/src/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 
 contract IntentRFQHookHarness is IntentRFQHook {
     constructor(IPoolManager _poolManager, address _lendingPool, address _l1PoolAddress) 
@@ -17,10 +19,6 @@ contract IntentRFQHookHarness is IntentRFQHook {
 
     function verifySolverSignature(SolverQuote memory quote) public returns (bool) {
         return super._verifySolverSignature(quote);
-    }
-    
-    function setAuthorizedSolver(address solver, bool auth) public {
-        isAuthorizedSolver[solver] = auth;
     }
 }
 
@@ -34,6 +32,9 @@ contract IntentRFQHookTest is Test, Deployers {
 
     uint256 solverPrivateKey = 0xA11CE;
     address solverAddress;
+
+    PoolKey poolKey;
+    PoolId poolId;
 
     function setUp() public {
         solverAddress = vm.addr(solverPrivateKey);
@@ -52,10 +53,25 @@ contract IntentRFQHookTest is Test, Deployers {
         hook = new IntentRFQHookHarness{salt: salt}(manager, mockAavePool, mockL1Pool);
         
         hook.setAuthorizedSolver(solverAddress, true);
+
+        // Initialize a pool with the hook
+        (poolKey, poolId) = initPool(currency0, currency1, hook, 3000, SQRT_PRICE_1_1);
     }
 
     function test_Initialization() public view {
         assertEq(address(hook.aavePool()), mockAavePool);
+        assertEq(hook.owner(), address(this));
+    }
+
+    function test_SetAuthorizedSolver() public {
+        // Owner can set
+        hook.setAuthorizedSolver(address(0x999), true);
+        assertTrue(hook.isAuthorizedSolver(address(0x999)));
+
+        // Non-owner cannot set
+        vm.prank(address(0x111));
+        vm.expectRevert();
+        hook.setAuthorizedSolver(address(0x999), false);
     }
 
     function test_HookPermissions() public view {
@@ -83,6 +99,36 @@ contract IntentRFQHookTest is Test, Deployers {
         });
 
         assertTrue(hook.verifySolverSignature(quote));
+        assertEq(hook.solverNonces(solverAddress), nonce + 1); // Nonce increments on success
+    }
+
+    function testFuzz_UnauthorizedSolver(uint256 amountIn, uint256 amountOut) public {
+        uint256 nonce = 0;
+        uint256 deadline = block.timestamp + 100;
+        
+        // Generate signature from unauthorized address
+        uint256 badPk = 0xBADC0DE;
+        address badSigner = vm.addr(badPk);
+
+        bytes32 messageHash = keccak256(abi.encodePacked(badSigner, amountIn, amountOut, nonce, deadline));
+        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(messageHash);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(badPk, ethSignedMessageHash);
+        bytes memory signature = abi.encodePacked(r, s, v);
+
+        IntentRFQHook.SolverQuote memory quote = IntentRFQHook.SolverQuote({
+            solver: badSigner,
+            amountIn: amountIn,
+            amountOut: amountOut,
+            nonce: nonce,
+            deadline: deadline,
+            signature: signature
+        });
+
+        // verifySolverSignature returns false for unauthorized solvers
+        assertFalse(hook.verifySolverSignature(quote));
+        
+        // Nonce should NOT increment if the signature isn't validly matched to an authorized solver
+        assertEq(hook.solverNonces(badSigner), 0); 
     }
 
     function testFuzz_InvalidNonce(uint256 amountIn, uint256 amountOut, uint256 badNonce) public {

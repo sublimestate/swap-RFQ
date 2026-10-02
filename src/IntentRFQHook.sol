@@ -13,9 +13,12 @@ import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {IERC20} from "forge-std/interfaces/IERC20.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IAaveV3Pool} from "./interfaces/IAaveV3Pool.sol";
+import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
 
-contract IntentRFQHook is BaseHook {
+contract IntentRFQHook is BaseHook, Ownable {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using StateLibrary for IPoolManager;
@@ -37,7 +40,7 @@ contract IntentRFQHook is BaseHook {
     error SignatureExpired();
     error InvalidNonce();
 
-    constructor(IPoolManager _poolManager, address _aavePool, address _l1PoolAddress) BaseHook(_poolManager) {
+    constructor(IPoolManager _poolManager, address _aavePool, address _l1PoolAddress) BaseHook(_poolManager) Ownable(msg.sender) {
         aavePool = IAaveV3Pool(_aavePool);
         l1PoolAddress = _l1PoolAddress;
     }
@@ -59,6 +62,11 @@ contract IntentRFQHook is BaseHook {
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
         });
+    }
+
+    /// @notice Authorize or deauthorize a solver
+    function setAuthorizedSolver(address solver, bool isAuthorized) external onlyOwner {
+        isAuthorizedSolver[solver] = isAuthorized;
     }
 
     // This data would be provided by the off-chain solver and signed
@@ -84,11 +92,30 @@ contract IntentRFQHook is BaseHook {
             bool isValid = _verifySolverSignature(quote);
             
             if (isValid) {
-                // 3. Price comparison: Ensure solver price is better than AMM
-                // (In a full implementation, we'd compare against the slot0 current price)
+                // 3. Price comparison: Ensure solver price is better than AMM Spot Price
+                (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(key.toId());
                 
+                // Calculate spot price expected output using safe math
+                uint256 expectedOutAMM;
+                if (params.zeroForOne) {
+                    // price = (sqrtPriceX96 * sqrtPriceX96) / 2^192
+                    uint256 priceX96 = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96)) >> 96;
+                    expectedOutAMM = (quote.amountIn * priceX96) >> 96;
+                } else {
+                    // price = 2^192 / (sqrtPriceX96 * sqrtPriceX96)
+                    uint256 priceX96 = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96)) >> 96;
+                    expectedOutAMM = (quote.amountIn << 96) / priceX96;
+                }
+                
+                // Revert or fallback if the solver is worse than the AMM spot price
+                // We fallback to AMM instead of reverting to let the trade go through
+                if (quote.amountOut < expectedOutAMM) {
+                    isValid = false;
+                }
+            }
+            
+            if (isValid) {
                 // 4. Execution: Facilitate direct settlement
-                // Execute transfers directly between user and solver
                 _settleWithSolver(key, params, quote);
 
                 // Return NoOp: instructed the pool that swap is fully handled
@@ -118,9 +145,6 @@ contract IntentRFQHook is BaseHook {
         if (block.timestamp > quote.deadline) revert SignatureExpired();
         if (quote.nonce != solverNonces[quote.solver]) revert InvalidNonce();
 
-        // Increment nonce
-        solverNonces[quote.solver]++;
-
         // Construct the message hash
         bytes32 messageHash = keccak256(abi.encodePacked(quote.solver, quote.amountIn, quote.amountOut, quote.nonce, quote.deadline));
         
@@ -129,7 +153,14 @@ contract IntentRFQHook is BaseHook {
         address recoveredSigner = ECDSA.recover(ethSignedMessageHash, quote.signature);
         
         // Verify the recovered signer matches the solver and is authorized
-        return recoveredSigner == quote.solver && isAuthorizedSolver[quote.solver];
+        bool isValid = recoveredSigner == quote.solver && isAuthorizedSolver[quote.solver];
+        
+        if (isValid) {
+            // Increment nonce only if signature is completely valid
+            solverNonces[quote.solver]++;
+        }
+        
+        return isValid;
     }
 
     function _settleWithSolver(PoolKey calldata key, SwapParams calldata params, SolverQuote memory quote) internal {
@@ -194,11 +225,8 @@ contract IntentRFQHook is BaseHook {
         }
     }
 
-    int24 public constant CLAWBACK_TICK_LOWER = -60;
-    int24 public constant CLAWBACK_TICK_UPPER = 60;
-
     function _jitClawback(PoolKey calldata key, SwapParams calldata params) internal {
-        // Calculate exact liquidity required for fallback
+        // Calculate exact token amount required for fallback
         uint256 requiredAmount = uint256(params.amountSpecified > 0 ? params.amountSpecified : -params.amountSpecified);
         
         // Identify which token the AMM needs for the user's exact input/output
@@ -209,13 +237,30 @@ contract IntentRFQHook is BaseHook {
             aavePool.withdraw(tokenToWithdraw, requiredAmount, address(this));
             
             // 2. Add liquidity to the Uniswap V4 Pool dynamically
-            // (Using requiredAmount as liquidityDelta for mock simplicity)
+            (uint160 sqrtPriceX96, int24 currentTick, , ) = poolManager.getSlot0(key.toId());
+            
+            // Snap to tick spacing for active range
+            int24 tickLower = (currentTick / key.tickSpacing) * key.tickSpacing;
+            if (currentTick < 0 && currentTick % key.tickSpacing != 0) tickLower -= key.tickSpacing;
+            int24 tickUpper = tickLower + key.tickSpacing;
+
+            uint160 sqrtRatioAX96 = TickMath.getSqrtPriceAtTick(tickLower);
+            uint160 sqrtRatioBX96 = TickMath.getSqrtPriceAtTick(tickUpper);
+
+            uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+                sqrtPriceX96,
+                sqrtRatioAX96,
+                sqrtRatioBX96,
+                params.zeroForOne ? requiredAmount : 0,
+                params.zeroForOne ? 0 : requiredAmount
+            );
+
             poolManager.modifyLiquidity(
                 key,
                 ModifyLiquidityParams({
-                    tickLower: CLAWBACK_TICK_LOWER,
-                    tickUpper: CLAWBACK_TICK_UPPER,
-                    liquidityDelta: int256(requiredAmount),
+                    tickLower: tickLower,
+                    tickUpper: tickUpper,
+                    liquidityDelta: int256(uint256(liquidity)),
                     salt: bytes32(0)
                 }),
                 new bytes(0)
