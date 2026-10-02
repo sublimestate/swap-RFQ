@@ -41,13 +41,13 @@ def generate_quote(intent):
     print(f"Solver offers: {amount_in} Token0 -> {better_amount_out} Token1")
     return amount_in, better_amount_out
 
-def sign_quote(amount_in, amount_out):
+def sign_quote(amount_in, amount_out, nonce, deadline):
     # Prepare payload matching SolverQuote struct
-    # struct SolverQuote { address solver; uint256 amountIn; uint256 amountOut; bytes signature; }
+    # struct SolverQuote { address solver; uint256 amountIn; uint256 amountOut; uint256 nonce; uint256 deadline; bytes signature; }
     
     message_hash = web3.keccak(eth_abi.encode(
-        ['address', 'uint256', 'uint256'],
-        [solver_account.address, amount_in, amount_out]
+        ['address', 'uint256', 'uint256', 'uint256', 'uint256'],
+        [solver_account.address, amount_in, amount_out, nonce, deadline]
     ))
     
     signable_message = encode_defunct(message_hash)
@@ -55,13 +55,13 @@ def sign_quote(amount_in, amount_out):
     
     return signed_message.signature
 
-def inject_transaction(amount_in, amount_out, signature):
+def inject_transaction(amount_in, amount_out, nonce, deadline, signature):
     print("Formatting payload for Uniswap V4 hookData injection...")
     
     # Encode the SolverQuote struct
     hook_data = eth_abi.encode(
-        ['(address,uint256,uint256,bytes)'],
-        [(solver_account.address, amount_in, amount_out, signature)]
+        ['(address,uint256,uint256,uint256,uint256,bytes)'],
+        [(solver_account.address, amount_in, amount_out, nonce, deadline, signature)]
     )
     
     print(f"Payload ready (hookData): {web3.to_hex(hook_data)}")
@@ -70,12 +70,17 @@ def inject_transaction(amount_in, amount_out, signature):
     print("Transaction successfully injected. Solver will execute NoOp path in IntentRFQHook.")
 
 def run_solver_mock():
+    nonce = 0
     while True:
         try:
             intent = monitor_mempool()
             amount_in, amount_out = generate_quote(intent)
-            signature = sign_quote(amount_in, amount_out)
-            inject_transaction(amount_in, amount_out, signature)
+            deadline = int(time.time()) + 300 # 5 minutes from now
+            
+            signature = sign_quote(amount_in, amount_out, nonce, deadline)
+            inject_transaction(amount_in, amount_out, nonce, deadline, signature)
+            
+            nonce += 1
             print("-" * 50)
             time.sleep(3)
         except KeyboardInterrupt:
