@@ -100,9 +100,16 @@ forge script script/DeployHook.s.sol --rpc-url <YOUR_RPC_URL> --broadcast
 
 ---
 
-## 📖 Roadmap (v2.0)
-- **ERC-7683 Integration**: Replace the proprietary `SolverQuote` struct with the native ERC-7683 `CrossChainOrder` standard to tap into global intent networks like UniswapX and Across.
-- **Inline Assembly ECDSA**: Strip high-level cryptography dependencies for hyper-optimized gas consumption on the hot path.
+## 🚀 Potential Additional Features (Roadmap)
+
+While the core protocol is production-ready, there are several advanced architectural upgrades that would take this hook to the next level:
+
+- **EIP-712 Typed Data Signatures**: Transition from raw `keccak256` hashing to EIP-712 structured data signing. This will make solver quotes fully transparent on block explorers and instantly compatible with established professional market-maker tooling.
+- **Yield Harvesting & LP Distribution**: Add a `harvestYield()` mechanism to explicitly claim the accrued Aave interest (where `aToken balance > principalAMM`) and auto-compound it into the pool as protocol-owned liquidity, or distribute it directly to LPs.
+- **Partial Fills & Hybrid AMM Routing**: Upgrade the `beforeSwap` logic to accept an array of quotes, allowing a solver to partially fill a massive trade at zero-slippage, while using `BeforeSwapDelta` to seamlessly route the remaining percentage to the standard AMM curve.
+- **Dynamic LVR Thresholds**: Instead of a hardcoded `0.5%` LVR threshold, dynamically adjust the allowable L1 vs. L2 price deviation based on real-time block-to-block implied volatility, preventing the pool from freezing during extreme organic market events.
+- **Yul / Inline Assembly Cryptography**: Rewrite the ABI decoding and signature recovery on the "hot path" entirely in Yul using the `0x01` `ecrecover` precompile. Stripping the OpenZeppelin Solidity overhead could save ~12,000 gas per trade.
+- **ERC-7683 Cross-Chain Intent Standardization**: Replace the proprietary `SolverQuote` struct with the native ERC-7683 `CrossChainOrder` standard to instantly plug the hook into global intent networks like UniswapX and Across Protocol.
 
 ## 📜 License
 MIT
