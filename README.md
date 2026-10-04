@@ -87,11 +87,14 @@ forge script script/TestnetVerify.s.sol --tc TestnetVerify --rpc-url <RPC> --bro
 ## Roadmap
 
 - **Production L1SLOAD LVR check** — real L1 `Slot0` read on Scroll (or fallback oracle) so the circuit breaker is live, not scaffolding.
-- **Slippage-aware quote comparison** — compare against true AMM execution price (depth + fees), not marginal spot.
-- **Aave utilization handling** — idle buffer + `try/catch` so 100% utilization degrades gracefully instead of bricking swaps.
 - **EIP-712 quotes** — structured signing for explorer transparency and market-maker tooling compat.
 - **Partial fills / hybrid routing** — one swap split across solver quotes and the AMM curve via `BeforeSwapDelta`.
 - **Gas** — raw `ecrecover` on the hot path (~12k gas/trade); the OZ overhead is documented in-code.
+
+## Recently shipped
+
+- **Slippage-aware quote comparison** — the solver must beat the AMM's *true* execution price, computed by a tick-by-tick simulation that replicates the PoolManager's swap math (fees, price impact, concentrated liquidity). Fuzz-tested bit-exact against real swaps.
+- **Aave graceful degradation** — JIT withdrawals are try/caught (a 100%-utilized lending pool skips JIT instead of bricking the swap), and sweeps leave a configurable idle buffer (10% default) in the AMM as baseline reserves.
 
 ## License
 MIT

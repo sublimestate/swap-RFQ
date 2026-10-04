@@ -370,9 +370,203 @@ contract IntentRFQHookTest is Test, Deployers {
         emit IntentRFQHook.IdleLiquiditySwept(poolId, 0, 0);
         hook.sweepIdleLiquidity(poolKey, tickLower, tickUpper, jitLiquidity);
 
+        // The idle buffer (10% default) stays in the AMM; the rest is recycled.
         (uint128 liqAfter,,) =
             manager.getPositionInfo(poolId, address(hook), tickLower, tickUpper, bytes32(0));
-        assertEq(liqAfter, 0, "JIT position fully removed");
+        uint256 expectedRemainder = jitLiquidity - (uint256(jitLiquidity) * 9000 / 10000);
+        assertEq(liqAfter, expectedRemainder, "idle buffer remains in AMM");
         assertGt(token1.balanceOf(address(mockAavePool)), aaveT1Before, "Aave received swept tokens");
+    }
+
+    /// @notice Setting the buffer to zero allows a full sweep of the position.
+    function test_SweepIdleLiquidity_ZeroBuffer() public {
+        hook.setIdleBufferBips(0);
+        _addLiquidity(-60000, 60000, 100 ether, 100 ether);
+
+        IERC20 token1 = IERC20(Currency.unwrap(currency1));
+        token1.transfer(address(mockAavePool), 10 ether);
+
+        swapRouter.swap(
+            poolKey,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        int24 spacing = poolKey.tickSpacing;
+        int24 tickLower = -3 * spacing;
+        int24 tickUpper = 0;
+        (uint128 jitLiquidity,,) =
+            manager.getPositionInfo(poolId, address(hook), tickLower, tickUpper, bytes32(0));
+        assertGt(jitLiquidity, 0, "JIT position exists");
+
+        hook.sweepIdleLiquidity(poolKey, tickLower, tickUpper, jitLiquidity);
+
+        (uint128 liqAfter,,) =
+            manager.getPositionInfo(poolId, address(hook), tickLower, tickUpper, bytes32(0));
+        assertEq(liqAfter, 0, "JIT position fully removed with zero buffer");
+    }
+
+    /// @notice Only the owner can change the buffer, and it is capped at 50%.
+    function test_SetIdleBufferBips() public {
+        assertEq(hook.idleBufferBips(), 1000, "default 10%");
+
+        hook.setIdleBufferBips(2500);
+        assertEq(hook.idleBufferBips(), 2500, "owner can set");
+
+        vm.expectRevert("buffer too high");
+        hook.setIdleBufferBips(5001);
+
+        vm.prank(address(0xBEEF));
+        vm.expectRevert();
+        hook.setIdleBufferBips(0);
+    }
+
+    /// @notice If the lending protocol cannot serve the JIT withdrawal (e.g. 100%
+    ///         utilization), the swap still executes against the AMM — it is not bricked.
+    function test_Fallback_SurvivesAaveIlliquidity() public {
+        _addLiquidity(-60000, 60000, 100 ether, 100 ether);
+
+        // Aave holds no token1: the mock's withdraw reverts (insufficient balance).
+        // The JIT must degrade gracefully instead of reverting the user's swap.
+        IERC20 token1 = IERC20(Currency.unwrap(currency1));
+        assertEq(token1.balanceOf(address(mockAavePool)), 0, "Aave empty");
+
+        uint256 userT0Before = IERC20(Currency.unwrap(currency0)).balanceOf(address(this));
+        uint256 userT1Before = token1.balanceOf(address(this));
+
+        swapRouter.swap(
+            poolKey,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        // Swap executed via the AMM's own reserves (user paid input, got output).
+        assertLt(IERC20(Currency.unwrap(currency0)).balanceOf(address(this)), userT0Before, "paid input");
+        assertGt(token1.balanceOf(address(this)), userT1Before, "received output");
+
+        // No hook-owned JIT position was created (JIT was skipped).
+        int24 spacing = poolKey.tickSpacing;
+        (uint128 jitLiquidity,,) =
+            manager.getPositionInfo(poolId, address(hook), -3 * spacing, 0, bytes32(0));
+        assertEq(jitLiquidity, 0, "no JIT position when Aave illiquid");
+    }
+
+    /// @notice simulateAMMSwap matches the real AMM execution exactly (no JIT here —
+    ///         Aave is empty so the JIT is skipped and the swap is pure AMM).
+    function test_SimulationMatchesAMM() public {
+        _addLiquidity(-60000, 60000, 100 ether, 100 ether);
+
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -int256(1 ether),
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        (, uint256 simOut, bool exact) = hook.simulateAMMSwap(poolKey, params);
+        assertTrue(exact, "simulation exact");
+
+        IERC20 token1 = IERC20(Currency.unwrap(currency1));
+        uint256 userT1Before = token1.balanceOf(address(this));
+        swapRouter.swap(poolKey, params, PoolSwapTest.TestSettings(false, false), "");
+        uint256 actualOut = token1.balanceOf(address(this)) - userT1Before;
+
+        assertEq(simOut, actualOut, "simulation matches AMM output");
+    }
+
+    /// @notice Fuzz: the simulation matches the real AMM across swap sizes.
+    function testFuzz_SimulationMatchesAMM(uint256 amountIn) public {
+        amountIn = bound(amountIn, 0.01 ether, 50 ether);
+        _addLiquidity(-60000, 60000, 100 ether, 100 ether);
+
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -int256(amountIn),
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        (, uint256 simOut, bool exact) = hook.simulateAMMSwap(poolKey, params);
+        assertTrue(exact, "simulation exact");
+
+        IERC20 token1 = IERC20(Currency.unwrap(currency1));
+        uint256 userT1Before = token1.balanceOf(address(this));
+        swapRouter.swap(poolKey, params, PoolSwapTest.TestSettings(false, false), "");
+        assertEq(token1.balanceOf(address(this)) - userT1Before, simOut, "simulation matches AMM");
+    }
+
+    /// @notice The quote check uses the true AMM execution price (fees + impact), not the
+    ///         marginal spot price. A quote between the true output and the spot estimate
+    ///         is better for the user than the AMM — it must WIN the fill.
+    function test_QuoteBeatsTrueAMMPrice_NotSpot() public {
+        _addLiquidity(-60000, 60000, 100 ether, 100 ether);
+
+        IERC20 token1 = IERC20(Currency.unwrap(currency1));
+        token1.transfer(solverAddress, 100 ether);
+        vm.prank(solverAddress);
+        token1.approve(address(hook), type(uint256).max);
+
+        uint256 amountIn = 10 ether;
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: -int256(amountIn),
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        (, uint256 ammOut, bool exact) = hook.simulateAMMSwap(poolKey, params);
+        assertTrue(exact, "simulation exact");
+        // 1:1 pool: the old spot check used amountIn as the bar. Fees + impact make
+        // the true output strictly lower.
+        assertLt(ammOut, amountIn, "true output below spot");
+
+        // Quote strictly between the true AMM output and spot: the old marginal-price
+        // check would reject this (quote < spot); the true-price check must accept it.
+        uint256 quoteOut = (ammOut + amountIn) / 2;
+        assertGt(quoteOut, ammOut, "quote beats AMM");
+        assertLt(quoteOut, amountIn, "quote below spot");
+
+        uint256 deadline = block.timestamp + 100;
+        bytes memory signature = _signQuote(solverPrivateKey, solverAddress, amountIn, quoteOut, 0, deadline, true);
+        bytes memory hookData = abi.encode(_makeQuote(amountIn, quoteOut, 0, deadline, true, signature));
+
+        uint256 userT1Before = token1.balanceOf(address(this));
+        swapRouter.swap(poolKey, params, PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), hookData);
+        assertEq(token1.balanceOf(address(this)), userT1Before + quoteOut, "solver fill at quoted price");
+    }
+
+    /// @notice Exact-output quotes are checked against the AMM's required INPUT:
+    ///         the solver must charge at most what the AMM would demand.
+    function test_QuoteExactOutput_BeatsAMMInput() public {
+        _addLiquidity(-60000, 60000, 100 ether, 100 ether);
+
+        IERC20 token1 = IERC20(Currency.unwrap(currency1));
+        token1.transfer(solverAddress, 100 ether);
+        vm.prank(solverAddress);
+        token1.approve(address(hook), type(uint256).max);
+
+        uint256 amountOut = 1 ether;
+        SwapParams memory params = SwapParams({
+            zeroForOne: true,
+            amountSpecified: int256(amountOut),
+            sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+        });
+
+        (uint256 ammIn,, bool exact) = hook.simulateAMMSwap(poolKey, params);
+        assertTrue(exact, "simulation exact");
+        assertGt(ammIn, amountOut, "AMM charges fee + impact over par");
+
+        // Solver charges slightly less than the AMM would: must win.
+        uint256 quoteIn = ammIn - 0.001 ether;
+        uint256 deadline = block.timestamp + 100;
+        bytes memory signature = _signQuote(solverPrivateKey, solverAddress, quoteIn, amountOut, 0, deadline, true);
+        bytes memory hookData = abi.encode(_makeQuote(quoteIn, amountOut, 0, deadline, true, signature));
+
+        IERC20 token0 = IERC20(Currency.unwrap(currency0));
+        uint256 userT0Before = token0.balanceOf(address(this));
+        uint256 userT1Before = token1.balanceOf(address(this));
+        swapRouter.swap(poolKey, params, PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}), hookData);
+
+        assertEq(token1.balanceOf(address(this)), userT1Before + amountOut, "exact output delivered");
+        assertEq(userT0Before - token0.balanceOf(address(this)), quoteIn, "paid quoted input");
     }
 }

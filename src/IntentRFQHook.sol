@@ -16,7 +16,9 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IAaveV3Pool} from "./interfaces/IAaveV3Pool.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
-import {FullMath} from "v4-core/src/libraries/FullMath.sol";
+import {SwapMath} from "v4-core/src/libraries/SwapMath.sol";
+import {LiquidityMath} from "v4-core/src/libraries/LiquidityMath.sol";
+import {BitMath} from "v4-core/src/libraries/BitMath.sol";
 import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
 
 /// @title IntentRFQHook
@@ -47,6 +49,17 @@ contract IntentRFQHook is BaseHook, Ownable {
     address public immutable l1PoolAddress;
     uint256 public constant MAX_SQRT_PRICE_DEVIATION_BIPS = 25; // ~0.5% price deviation
 
+    /// @notice Share of hook-owned position liquidity (in bips) that sweepIdleLiquidity
+    ///         always leaves in the AMM. This idle buffer keeps baseline reserves in the
+    ///         pool so fallback swaps still execute when the lending protocol is
+    ///         illiquid (e.g. 100% utilization) and JIT cannot be served.
+    uint256 public idleBufferBips = 1000; // 10%
+
+    /// @notice Maximum tick-boundary steps when simulating the AMM swap for quote
+    ///         comparison. If a swap would cross more boundaries, the quote is
+    ///         rejected (safe AMM fallback) rather than estimated.
+    uint256 private constant MAX_QUOTE_SIM_STEPS = 64;
+
     event SolverFill(
         PoolId indexed poolId,
         address indexed solver,
@@ -57,6 +70,7 @@ contract IntentRFQHook is BaseHook, Ownable {
     event LVRBlocked(PoolId indexed poolId, uint160 sqrtPriceX96L2, uint160 sqrtPriceX96L1);
     event JITLiquidityAdded(PoolId indexed poolId, address indexed token, uint256 amount, uint128 liquidity);
     event IdleLiquiditySwept(PoolId indexed poolId, uint256 amount0, uint256 amount1);
+    event IdleBufferSet(uint256 bips);
 
     error LVRAttackDetected();
 
@@ -90,6 +104,15 @@ contract IntentRFQHook is BaseHook, Ownable {
     /// @notice Authorize or deauthorize a solver
     function setAuthorizedSolver(address solver, bool authorized) external onlyOwner {
         isAuthorizedSolver[solver] = authorized;
+    }
+
+    /// @notice Sets the idle buffer kept in the AMM by sweepIdleLiquidity.
+    /// @param bips Buffer in basis points (1000 = 10%). Capped at 50% — a larger
+    ///        buffer would defeat the purpose of sweeping idle liquidity to yield.
+    function setIdleBufferBips(uint256 bips) external onlyOwner {
+        require(bips <= 5000, "buffer too high");
+        idleBufferBips = bips;
+        emit IdleBufferSet(bips);
     }
 
     /// @notice Off-chain solver quote, provided by the swapper via hookData and signed by the solver.
@@ -163,19 +186,25 @@ contract IntentRFQHook is BaseHook, Ownable {
 
         if (!_verifySolverSignature(key, params.zeroForOne, quote)) return false;
 
-        // The solver must beat the AMM spot price. Note: this compares against the
-        // marginal spot price and ignores price impact/fees (see roadmap: slippage handling).
-        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
-        uint256 priceX96 = FullMath.mulDiv(sqrtPriceX96, sqrtPriceX96, 1 << 96);
-        uint256 expectedOutAMM;
-        if (params.zeroForOne) {
-            // price = token1/token0 = (sqrtPriceX96^2) / 2^192
-            expectedOutAMM = FullMath.mulDiv(quote.amountIn, priceX96, 1 << 96);
-        } else {
-            expectedOutAMM = FullMath.mulDiv(quote.amountIn, 1 << 96, priceX96);
+        // The solver must beat the AMM's TRUE execution price — not the marginal
+        // spot price. The simulation replicates the PoolManager's own swap math
+        // (LP fees, price impact, concentrated liquidity across ticks). If it
+        // cannot complete exactly, or reverts for any reason, the quote is
+        // rejected and the swap safely falls back to the AMM.
+        try this.simulateAMMSwap(key, params) returns (
+            uint256 ammAmountIn, uint256 ammAmountOut, bool exact
+        ) {
+            if (!exact) return false;
+            if (params.amountSpecified < 0) {
+                // Exact input: solver must deliver at least the AMM's output.
+                return quote.amountOut >= ammAmountOut;
+            } else {
+                // Exact output: solver must charge at most the AMM's required input.
+                return quote.amountIn <= ammAmountIn;
+            }
+        } catch {
+            return false;
         }
-
-        return quote.amountOut >= expectedOutAMM;
     }
 
     // TODO(Optimization): Replace OpenZeppelin ECDSA with raw inline assembly `ecrecover`
@@ -204,6 +233,156 @@ contract IntentRFQHook is BaseHook, Ownable {
         // Increment nonce only once the signature is fully valid.
         solverNonces[quote.solver]++;
         return true;
+    }
+
+    /// @notice Simulates the AMM swap tick-by-tick against live pool state, replicating
+    ///         the PoolManager's swap math: LP fees, price impact, and concentrated
+    ///         liquidity across tick boundaries.
+    /// @dev External so callers can try/catch it. A revert — or an inexact result —
+    ///      must always resolve to AMM fallback, never to bricking the user's swap.
+    ///      Uses the pool's LP fee only; if a protocol fee were set, ignoring it
+    ///      overestimates AMM output, which is the safe direction (higher bar for
+    ///      the solver, never a worse fill for the user).
+    /// @return totalAmountIn Total input the AMM would consume, including fees.
+    /// @return totalAmountOut Total output the AMM would produce.
+    /// @return exact False if the simulation hit the step bound or ran out of
+    ///         liquidity/range: the totals are then a lower bound, not the true price.
+    function simulateAMMSwap(PoolKey calldata key, SwapParams calldata params)
+        external
+        view
+        returns (uint256 totalAmountIn, uint256 totalAmountOut, bool exact)
+    {
+        PoolId poolId = key.toId();
+        (uint160 sqrtPriceX96, int24 tick,, uint24 lpFee) = poolManager.getSlot0(poolId);
+
+        QuoteSim memory sim = QuoteSim({
+            sqrtPrice: sqrtPriceX96,
+            tick: tick,
+            liquidity: poolManager.getLiquidity(poolId),
+            amountRemaining: params.amountSpecified,
+            amountIn: 0,
+            amountOut: 0,
+            spacing: key.tickSpacing,
+            zeroForOne: params.zeroForOne,
+            exactInput: params.amountSpecified < 0,
+            lpFee: lpFee,
+            poolId: poolId
+        });
+
+        for (uint256 i = 0; i < MAX_QUOTE_SIM_STEPS;) {
+            (bool done, bool ok) = _quoteSimStep(sim);
+            if (done) return (sim.amountIn, sim.amountOut, ok);
+            unchecked {
+                ++i;
+            }
+        }
+        return (sim.amountIn, sim.amountOut, false);
+    }
+
+    /// @dev Mutable state for the AMM swap simulation (struct keeps stack shallow).
+    struct QuoteSim {
+        uint160 sqrtPrice;
+        int24 tick;
+        uint128 liquidity;
+        int256 amountRemaining;
+        uint256 amountIn;
+        uint256 amountOut;
+        int24 spacing;
+        bool zeroForOne;
+        bool exactInput;
+        uint24 lpFee;
+        PoolId poolId;
+    }
+
+    /// @dev Executes one step of the simulation, targeting the next initialized tick
+    ///      (or word edge), exactly mirroring Pool.swap's loop.
+    /// @return done True when the simulation completed (ok distinguishes exact vs inexact).
+    function _quoteSimStep(QuoteSim memory sim) internal view returns (bool done, bool ok) {
+        if (sim.amountRemaining == 0) return (true, true);
+        if (sim.liquidity == 0) return (true, false);
+
+        (int24 tickNext, bool initialized) =
+            _nextInitializedTick(sim.poolId, sim.tick, sim.spacing, sim.zeroForOne);
+        // The bitmap is unaware of the min/max tick bounds — clamp like Pool.swap does.
+        if (tickNext < TickMath.MIN_TICK) tickNext = TickMath.MIN_TICK;
+        if (tickNext > TickMath.MAX_TICK) tickNext = TickMath.MAX_TICK;
+        uint160 targetPrice = TickMath.getSqrtPriceAtTick(tickNext);
+
+        (uint160 sqrtPriceNext, uint256 stepIn, uint256 stepOut, uint256 feeAmount) =
+            SwapMath.computeSwapStep(sim.sqrtPrice, targetPrice, sim.liquidity, sim.amountRemaining, sim.lpFee);
+
+        if (sim.exactInput) {
+            sim.amountRemaining += int256(stepIn + feeAmount);
+            sim.amountOut += stepOut;
+        } else {
+            sim.amountRemaining -= int256(stepOut);
+            sim.amountIn += stepIn + feeAmount;
+        }
+        sim.sqrtPrice = sqrtPriceNext;
+
+        if (sqrtPriceNext == targetPrice) {
+            if (tickNext == TickMath.MIN_TICK || tickNext == TickMath.MAX_TICK) {
+                return (true, false); // ran out of price range with amount remaining
+            }
+            if (initialized) {
+                (, int128 liquidityNet) = poolManager.getTickLiquidity(sim.poolId, tickNext);
+                sim.liquidity = LiquidityMath.addDelta(
+                    sim.liquidity, sim.zeroForOne ? -liquidityNet : liquidityNet
+                );
+            }
+            sim.tick = sim.zeroForOne ? tickNext - 1 : tickNext;
+        }
+        return (false, false);
+    }
+
+    /// @dev Replicates TickBitmap.nextInitializedTickWithinOneWord against the pool's
+    ///      tick bitmap (fetched via StateLibrary). Searches a single word; when no
+    ///      initialized tick is found, returns the word edge uninitialized and the
+    ///      outer loop continues from the adjacent word.
+    function _nextInitializedTick(PoolId poolId, int24 tick, int24 spacing, bool lte)
+        internal
+        view
+        returns (int24 next, bool initialized)
+    {
+        int24 compressed = _compressTick(tick, spacing);
+        if (lte) {
+            (int16 wordPos, uint8 bitPos) = _tickPosition(compressed);
+            uint256 masked =
+                poolManager.getTickBitmap(poolId, wordPos) & (type(uint256).max >> (255 - bitPos));
+            if (masked != 0) {
+                uint8 msb = BitMath.mostSignificantBit(masked);
+                next = (compressed - int24(uint24(bitPos - msb))) * spacing;
+                initialized = true;
+            } else {
+                next = (compressed - int24(uint24(bitPos))) * spacing;
+                initialized = false;
+            }
+        } else {
+            int24 c1 = compressed + 1;
+            (int16 wordPos, uint8 bitPos) = _tickPosition(c1);
+            uint256 masked = poolManager.getTickBitmap(poolId, wordPos) & (~((1 << bitPos) - 1));
+            if (masked != 0) {
+                uint8 lsb = BitMath.leastSignificantBit(masked);
+                next = (c1 + int24(uint24(lsb - bitPos))) * spacing;
+                initialized = true;
+            } else {
+                next = (c1 + int24(uint24(255 - bitPos))) * spacing;
+                initialized = false;
+            }
+        }
+    }
+
+    /// @dev Tick divided by spacing, rounded toward negative infinity.
+    function _compressTick(int24 tick, int24 spacing) internal pure returns (int24) {
+        int24 compressed = tick / spacing;
+        if (tick < 0 && tick % spacing != 0) compressed -= 1;
+        return compressed;
+    }
+
+    /// @dev Word position and bit position of a compressed tick in the bitmap.
+    function _tickPosition(int24 compressed) internal pure returns (int16 wordPos, uint8 bitPos) {
+        wordPos = int16(compressed >> 8);
+        bitPos = uint8(uint24(compressed) & 0xff);
     }
 
     /// @notice Settles a solver fill: the hook takes the user's input tokens (which the swapper
@@ -278,7 +457,9 @@ contract IntentRFQHook is BaseHook, Ownable {
     ///      - oneForZero (price moves up):   token0-only range ABOVE the current price.
     ///      The position is owned by the hook (salt 0) and is permanent — use
     ///      `sweepIdleLiquidity` to recycle it back into the lending protocol.
-    ///      Best-effort: never bricks the user's swap if JIT can't be placed.
+    ///      Best-effort: never bricks the user's swap. If the lending protocol cannot
+    ///      serve the withdrawal (e.g. 100% utilization), JIT is skipped and the swap
+    ///      executes against the AMM's own reserves.
     function _jitClawback(PoolKey calldata key, SwapParams calldata params) internal {
         // Calculate exact token amount required for the fallback swap
         uint256 requiredAmount = uint256(params.amountSpecified > 0 ? params.amountSpecified : -params.amountSpecified);
@@ -288,6 +469,17 @@ contract IntentRFQHook is BaseHook, Ownable {
         bool zeroForOne = params.zeroForOne;
         address tokenToWithdraw = zeroForOne ? Currency.unwrap(key.currency1) : Currency.unwrap(key.currency0);
         if (tokenToWithdraw == address(0)) return;
+
+        // 1. Just-in-time withdrawal from the yield-generating protocol.
+        //    Graceful degradation: a failed or empty withdrawal skips JIT entirely —
+        //    transient lending-protocol illiquidity must not brick DEX trade execution.
+        uint256 withdrawn;
+        try aavePool.withdraw(tokenToWithdraw, requiredAmount, address(this)) returns (uint256 amount) {
+            withdrawn = amount;
+        } catch {
+            return;
+        }
+        if (withdrawn == 0) return;
 
         int24 spacing = key.tickSpacing;
         (uint160 sqrtPriceX96, int24 currentTick,,) = poolManager.getSlot0(key.toId());
@@ -309,19 +501,22 @@ contract IntentRFQHook is BaseHook, Ownable {
         }
 
         // Best-effort: skip JIT rather than reverting the swap at extreme ticks.
-        if (tickLower < TickMath.MIN_TICK || tickUpper > TickMath.MAX_TICK) return;
+        if (tickLower < TickMath.MIN_TICK || tickUpper > TickMath.MAX_TICK) {
+            _supplyToAave(tokenToWithdraw, withdrawn); // don't strand the funds
+            return;
+        }
 
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
             sqrtPriceX96,
             TickMath.getSqrtPriceAtTick(tickLower),
             TickMath.getSqrtPriceAtTick(tickUpper),
-            zeroForOne ? 0 : requiredAmount,
-            zeroForOne ? requiredAmount : 0
+            zeroForOne ? 0 : withdrawn,
+            zeroForOne ? withdrawn : 0
         );
-        if (liquidity == 0) return;
-
-        // 1. Just-in-time withdrawal from the yield-generating protocol
-        aavePool.withdraw(tokenToWithdraw, requiredAmount, address(this));
+        if (liquidity == 0) {
+            _supplyToAave(tokenToWithdraw, withdrawn); // don't strand the funds
+            return;
+        }
 
         // 2. Add output-side liquidity to the Uniswap V4 pool ahead of the price direction
         poolManager.modifyLiquidity(
@@ -338,10 +533,19 @@ contract IntentRFQHook is BaseHook, Ownable {
         // 3. Settle the newly added liquidity with the PoolManager
         //    Note: sync() must come BEFORE the transfer so settle() measures the increase.
         poolManager.sync(Currency.wrap(tokenToWithdraw));
-        IERC20(tokenToWithdraw).transfer(address(poolManager), requiredAmount);
+        IERC20(tokenToWithdraw).transfer(address(poolManager), withdrawn);
         poolManager.settle();
 
-        emit JITLiquidityAdded(key.toId(), tokenToWithdraw, requiredAmount, liquidity);
+        emit JITLiquidityAdded(key.toId(), tokenToWithdraw, withdrawn, liquidity);
+    }
+
+    /// @dev Supplies tokens to the lending protocol, approving it once per token.
+    function _supplyToAave(address token, uint256 amount) internal {
+        if (!isAaveApproved[token]) {
+            IERC20(token).approve(address(aavePool), type(uint256).max);
+            isAaveApproved[token] = true;
+        }
+        aavePool.supply(token, amount, address(this), 0);
     }
 
     /// @dev Packs (specified, unspecified) with the specified delta in the high 128 bits,
@@ -385,10 +589,18 @@ contract IntentRFQHook is BaseHook, Ownable {
     /// @notice Unlock callback for sweepIdleLiquidity: removes the hook-owned liquidity,
     ///         takes the withdrawn tokens, and supplies them to the lending protocol.
     /// @dev Only the PoolManager can invoke this, and only as a result of this hook
-    ///      calling poolManager.unlock from sweepIdleLiquidity.
+    ///      calling poolManager.unlock from sweepIdleLiquidity. The idle buffer is
+    ///      enforced here: at most (10000 - idleBufferBips) of the position's current
+    ///      liquidity is removed, so baseline reserves stay in the AMM.
     function unlockCallback(bytes calldata data) external returns (bytes memory) {
         require(msg.sender == address(poolManager), "only PoolManager");
         SweepCallbackData memory d = abi.decode(data, (SweepCallbackData));
+
+        (uint128 positionLiquidity,,) =
+            poolManager.getPositionInfo(d.key.toId(), address(this), d.tickLower, d.tickUpper, bytes32(0));
+        uint256 maxRemovable = uint256(positionLiquidity) * (10000 - idleBufferBips) / 10000;
+        uint256 liquidityToRemove = d.liquidityToRemove > maxRemovable ? maxRemovable : d.liquidityToRemove;
+        if (liquidityToRemove == 0) return "";
 
         // 1. Remove liquidity from Uniswap V4
         (BalanceDelta delta,) = poolManager.modifyLiquidity(
@@ -396,7 +608,7 @@ contract IntentRFQHook is BaseHook, Ownable {
             ModifyLiquidityParams({
                 tickLower: d.tickLower,
                 tickUpper: d.tickUpper,
-                liquidityDelta: -int256(d.liquidityToRemove),
+                liquidityDelta: -int256(liquidityToRemove),
                 salt: bytes32(0)
             }),
             new bytes(0)
@@ -410,12 +622,7 @@ contract IntentRFQHook is BaseHook, Ownable {
             amount0 = uint256(uint128(delta.amount0()));
 
             poolManager.take(d.key.currency0, address(this), amount0);
-
-            if (!isAaveApproved[token0]) {
-                IERC20(token0).approve(address(aavePool), type(uint256).max);
-                isAaveApproved[token0] = true;
-            }
-            aavePool.supply(token0, amount0, address(this), 0);
+            _supplyToAave(token0, amount0);
         }
 
         if (delta.amount1() > 0) {
@@ -423,12 +630,7 @@ contract IntentRFQHook is BaseHook, Ownable {
             amount1 = uint256(uint128(delta.amount1()));
 
             poolManager.take(d.key.currency1, address(this), amount1);
-
-            if (!isAaveApproved[token1]) {
-                IERC20(token1).approve(address(aavePool), type(uint256).max);
-                isAaveApproved[token1] = true;
-            }
-            aavePool.supply(token1, amount1, address(this), 0);
+            _supplyToAave(token1, amount1);
         }
 
         emit IdleLiquiditySwept(d.key.toId(), amount0, amount1);
