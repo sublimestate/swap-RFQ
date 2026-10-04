@@ -33,9 +33,11 @@ In V4, a hook's active callbacks are defined by the **leading bits of its deploy
 - More importantly, you **MUST** update the `flags` variable in both `test/IntentRFQHook.t.sol` and `script/DeployHook.s.sol` (e.g., `Hooks.BEFORE_SWAP_FLAG | Hooks.AFTER_SWAP_FLAG`). If you do not do this, `HookMiner` will mine the wrong prefix, and the pool manager will ignore the new callback.
 
 ### 2. Transient Accounting (BeforeSwapDelta)
-When the hook intercepts a swap and settles it via the solver, it returns a custom `BeforeSwapDelta` (the "NoOp" path). 
-- To balance the `PoolManager`'s accounting during the lock, the hook actively calls `poolManager.mint()` (for ERC6909 claims) and `poolManager.settle()`.
-- If modifying token flows, remember that the hook itself assumes liability for the tokens during `_settleWithSolver`.
+When the hook takes over a swap and settles it via the solver, it returns a custom `BeforeSwapDelta`:
+- the **specified** component is `-params.amountSpecified`, which zeroes out the AMM leg (`amountToSwap -> 0`; the PoolManager short-circuits a zero-amount swap),
+- the **unspecified** component encodes the hook's obligation (`-amountOut` for exact-in, `+amountIn` for exact-out).
+The PoolManager bills that delta to the hook and deducts it from the swapper. To balance its own books the hook calls `poolManager.take()` (claims its input-token credit and forwards it to the solver) and pulls the solver's output tokens via `transferFrom`, then `sync()` + `settle()`. **Order matters: `sync()` must come BEFORE the token transfer** so `settle()` measures the balance increase — reversing them silently settles zero and the whole unlock reverts with `CurrencyNotSettled`.
+If modifying token flows, remember that the hook's `take` transiently fronts pool reserves (the swapper replenishes them when settling their own bill), so the pool must hold >= the fill amount of the input token.
 
 ### 3. JIT Clawback Math
 The fallback mechanism uses `LiquidityAmounts.getLiquidityForAmounts()` to dynamically convert the requested `requiredAmount` into a `liquidityDelta`. It snaps to the pool's specific `tickSpacing`. If you alter pool initialization in the tests, ensure `tickSpacing` aligns with the mocked ranges.
