@@ -5,7 +5,7 @@ A highly optimized, synchronous Request-For-Quote (RFQ) smart contract hook for 
 ## 🌟 Key Features
 
 ### 1. Direct Solver Settlement (Zero Slippage)
-Intersects users' swaps via the `beforeSwap` callback. If a trusted off-chain solver can offer a better price than the AMM, the hook intercepts the flow. Using V4's `BeforeSwapDelta` NoOp flags and `ERC6909` minting, it completely bypasses the AMM math and settles the trade directly between the user and the solver at an exact, zero-slippage price.
+Intersects users' swaps via the `beforeSwap` callback. If a trusted off-chain solver can offer a better price than the AMM, the hook takes over the swap entirely: the returned `BeforeSwapDelta` zeroes out the AMM leg while encoding the hook's obligation, the hook forwards the user's input tokens to the solver via `take`, and pulls the solver's output tokens via `transferFrom` to settle. The user receives exactly the quoted amount with zero slippage.
 
 ### 2. Synthetic Idle Liquidity Sweeping
 If solvers handle the majority of trading volume, AMM liquidity sits idle. `IntentRFQ` solves this by permissionlessly sweeping idle AMM capital into **Aave V3** to generate continuous interest for LPs. 
@@ -13,8 +13,8 @@ If solvers handle the majority of trading volume, AMM liquidity sits idle. `Inte
 ### 3. Just-In-Time (JIT) Clawback
 If the solver network fails to quote a trade and it falls back to the AMM, the hook dynamically calculates the exact liquidity required. It performs a synchronous JIT withdrawal from Aave and re-injects it into the V4 PoolManager seamlessly to execute the trade.
 
-### 4. L1SLOAD LVR Protection
-Built for L2s like Scroll, the hook uses the `L1SLOAD` precompile to synchronously read the exact Ethereum Mainnet (Layer 1) Uniswap V3 `Slot0` price. If the L2 price deviates by > 0.5% from the L1 price, the hook detects impending toxic arbitrage and reverts the transaction, virtually eliminating Loss Versus Rebalancing (LVR) for LPs.
+### 4. L1SLOAD LVR Protection (Scaffold)
+Built for L2s like Scroll, the hook is designed to use the `L1SLOAD` precompile to synchronously read the Ethereum Mainnet (Layer 1) Uniswap V3 `Slot0` price. If the L2 price deviates by > 0.5% from the L1 price, the hook detects impending toxic arbitrage and reverts the transaction. **Status: the check scaffolding and threshold logic are implemented, but the L1 price read itself is currently a placeholder** — on chains without the precompile the check is skipped. See the roadmap for the production implementation.
 
 ---
 
@@ -37,10 +37,9 @@ sequenceDiagram
     IntentRFQHook->>IntentRFQHook: Verify Solver Signature & Nonce
     
     alt Solver Price is Better
-        IntentRFQHook->>PoolManager: mint ERC6909 to Solver (TokenIn)
-        Solver->>IntentRFQHook: transferFrom(TokenOut)
-        IntentRFQHook->>PoolManager: settle()
-        IntentRFQHook-->>PoolManager: Return NoOp BeforeSwapDelta
+        IntentRFQHook->>PoolManager: take(TokenIn) → forward to Solver
+        Solver->>PoolManager: transferFrom(TokenOut) → hook settles
+        IntentRFQHook-->>PoolManager: Return BeforeSwapDelta (AMM leg zeroed)
     else AMM Fallback
         IntentRFQHook->>IntentRFQHook: _checkLVRProtection (L1SLOAD)
         IntentRFQHook->>AaveV3: withdraw(requiredLiquidity)
@@ -102,8 +101,9 @@ forge script script/DeployHook.s.sol --rpc-url <YOUR_RPC_URL> --broadcast
 
 ## 🚀 Potential Additional Features (Roadmap)
 
-While the core protocol is production-ready, there are several advanced architectural upgrades that would take this hook to the next level:
+While the core protocol is functional and covered by Foundry tests (including an end-to-end solver-fill test), there are several advanced architectural upgrades that would take this hook to the next level:
 
+- **Production L1SLOAD LVR check**: replace the placeholder precompile call with a real L1 `Slot0` read on Scroll (or a fallback oracle) so the LVR circuit breaker is live rather than scaffolding.
 - **EIP-712 Typed Data Signatures**: Transition from raw `keccak256` hashing to EIP-712 structured data signing. This will make solver quotes fully transparent on block explorers and instantly compatible with established professional market-maker tooling.
 - **Yield Harvesting & LP Distribution**: Add a `harvestYield()` mechanism to explicitly claim the accrued Aave interest (where `aToken balance > principalAMM`) and auto-compound it into the pool as protocol-owned liquidity, or distribute it directly to LPs.
 - **Partial Fills & Hybrid AMM Routing**: Upgrade the `beforeSwap` logic to accept an array of quotes, allowing a solver to partially fill a massive trade at zero-slippage, while using `BeforeSwapDelta` to seamlessly route the remaining percentage to the standard AMM curve.

@@ -16,31 +16,54 @@ import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {IAaveV3Pool} from "./interfaces/IAaveV3Pool.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {FullMath} from "v4-core/src/libraries/FullMath.sol";
 import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
 
+/// @title IntentRFQHook
+/// @notice Uniswap V4 hook for intent-based RFQ execution.
+/// @dev Intercepts swaps in `beforeSwap`. If an authorized off-chain solver quotes a price
+///      better than the AMM spot price, the hook takes over the swap entirely:
+///      - the returned `BeforeSwapDelta` zeroes out the AMM leg (specified delta cancels
+///        `amountSpecified`) and encodes the hook's obligation (unspecified delta),
+///      - the hook claims the user's input tokens via `take` and forwards them to the solver,
+///      - the hook pulls the solver's output tokens via `transferFrom` and settles them,
+///      so the user receives exactly the quoted amount with zero slippage.
+///      If no valid solver quote is present, the swap falls back to the AMM with
+///      LVR protection and JIT liquidity sourced from Aave V3.
 contract IntentRFQHook is BaseHook, Ownable {
     using PoolIdLibrary for PoolKey;
     using CurrencyLibrary for Currency;
     using StateLibrary for IPoolManager;
 
     IAaveV3Pool public immutable aavePool;
-    
+
     mapping(address => bool) public isAuthorizedSolver;
     mapping(address => uint256) public solverNonces;
     mapping(address => bool) public isAaveApproved; // Tracks infinite approvals to save gas
-    
-    // Scroll L1SLOAD precompile address mock
+
+    // Scroll L1SLOAD precompile address
     address public constant L1_SLOAD_PRECOMPILE = 0x0000000000000000000000000000000000000101;
-    
+
     address public immutable l1PoolAddress;
     uint256 public constant MAX_SQRT_PRICE_DEVIATION_BIPS = 25; // ~0.5% price deviation
-    
-    error InvalidSignature();
-    error LVRAttackDetected();
-    error SignatureExpired();
-    error InvalidNonce();
 
-    constructor(IPoolManager _poolManager, address _aavePool, address _l1PoolAddress) BaseHook(_poolManager) Ownable(msg.sender) {
+    event SolverFill(
+        PoolId indexed poolId,
+        address indexed solver,
+        address indexed taker,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+    event LVRBlocked(PoolId indexed poolId, uint160 sqrtPriceX96L2, uint160 sqrtPriceX96L1);
+    event JITLiquidityAdded(PoolId indexed poolId, address indexed token, uint256 amount, uint128 liquidity);
+    event IdleLiquiditySwept(PoolId indexed poolId, uint256 amount0, uint256 amount1);
+
+    error LVRAttackDetected();
+
+    constructor(IPoolManager _poolManager, address _aavePool, address _l1PoolAddress)
+        BaseHook(_poolManager)
+        Ownable(msg.sender)
+    {
         aavePool = IAaveV3Pool(_aavePool);
         l1PoolAddress = _l1PoolAddress;
     }
@@ -65,11 +88,13 @@ contract IntentRFQHook is BaseHook, Ownable {
     }
 
     /// @notice Authorize or deauthorize a solver
-    function setAuthorizedSolver(address solver, bool isAuthorized) external onlyOwner {
-        isAuthorizedSolver[solver] = isAuthorized;
+    function setAuthorizedSolver(address solver, bool authorized) external onlyOwner {
+        isAuthorizedSolver[solver] = authorized;
     }
 
-    // This data would be provided by the off-chain solver and signed
+    /// @notice Off-chain solver quote, provided by the swapper via hookData and signed by the solver.
+    /// @dev The signature binds the pool, swap direction, amounts, nonce and deadline to prevent
+    ///      cross-pool and cross-direction replay of quotes.
     struct SolverQuote {
         address solver;
         uint256 amountIn;
@@ -84,140 +109,159 @@ contract IntentRFQHook is BaseHook, Ownable {
         override
         returns (bytes4, BeforeSwapDelta, uint24)
     {
-        // 1. Unpack hookData
         if (hookData.length > 0) {
             SolverQuote memory quote = abi.decode(hookData, (SolverQuote));
-            
-            // 2. Verify solver signature (simplified for v1.0)
-            bool isValid = _verifySolverSignature(quote);
-            
-            if (isValid) {
-                // 3. Price comparison: Ensure solver price is better than AMM Spot Price
-                (uint160 sqrtPriceX96, , , ) = poolManager.getSlot0(key.toId());
-                
-                // Calculate spot price expected output using safe math
-                uint256 expectedOutAMM;
-                if (params.zeroForOne) {
-                    // price = (sqrtPriceX96 * sqrtPriceX96) / 2^192
-                    uint256 priceX96 = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96)) >> 96;
-                    expectedOutAMM = (quote.amountIn * priceX96) >> 96;
-                } else {
-                    // price = 2^192 / (sqrtPriceX96 * sqrtPriceX96)
-                    uint256 priceX96 = (uint256(sqrtPriceX96) * uint256(sqrtPriceX96)) >> 96;
-                    expectedOutAMM = (quote.amountIn << 96) / priceX96;
-                }
-                
-                // Revert or fallback if the solver is worse than the AMM spot price
-                // We fallback to AMM instead of reverting to let the trade go through
-                if (quote.amountOut < expectedOutAMM) {
-                    isValid = false;
-                }
-            }
-            
-            if (isValid) {
-                // 4. Execution: Facilitate direct settlement
+
+            if (_isValidSolverFill(key, params, quote)) {
                 _settleWithSolver(key, params, quote);
 
-                // Return NoOp: instructed the pool that swap is fully handled
-                // Calculate precise custom delta matching the swap
-                int256 amount0 = params.zeroForOne ? params.amountSpecified : -int256(quote.amountOut);
-                int256 amount1 = params.zeroForOne ? -int256(quote.amountOut) : params.amountSpecified;
-                
-                BeforeSwapDelta customDelta = toBeforeSwapDelta(int128(amount0), int128(amount1));
-                
-                return (BaseHook.beforeSwap.selector, customDelta, 0);
+                // Take over the swap entirely:
+                // - the specified delta cancels the AMM leg (amountToSwap -> 0),
+                // - the unspecified delta encodes the hook's obligation to the PoolManager,
+                //   which the PoolManager bills to the hook and deducts from the swapper.
+                int256 deltaSpecified = -params.amountSpecified;
+                int256 deltaUnspecified =
+                    params.amountSpecified < 0 ? -int256(quote.amountOut) : int256(quote.amountIn);
+
+                emit SolverFill(key.toId(), quote.solver, sender, quote.amountIn, quote.amountOut);
+
+                return (
+                    BaseHook.beforeSwap.selector,
+                    toBeforeSwapDelta(int128(deltaSpecified), int128(deltaUnspecified)),
+                    0
+                );
             }
+            // Invalid, stale or uncompetitive quote: fall through to the AMM path below.
         }
 
-        // 5. Fallback: Standard AMM execution
-        // Check LVR protection first
+        // AMM fallback path.
         _checkLVRProtection(key);
-        
-        // JIT Clawback: withdraw needed liquidity from Lending Protocol
+
+        // JIT Clawback: pull output-side liquidity from the lending protocol just in time.
         _jitClawback(key, params);
-        
+
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+    }
+
+    /// @notice Checks that a solver quote is well-formed, fresh, signed by an authorized solver,
+    ///         matches the swap being executed, and beats the AMM spot price.
+    /// @dev Never reverts: any failure falls back to AMM execution.
+    function _isValidSolverFill(PoolKey calldata key, SwapParams calldata params, SolverQuote memory quote)
+        internal
+        returns (bool)
+    {
+        // The quote must be for the exact amounts being swapped.
+        if (params.amountSpecified < 0) {
+            if (quote.amountIn != uint256(-params.amountSpecified)) return false;
+        } else {
+            if (quote.amountOut != uint256(params.amountSpecified)) return false;
+        }
+
+        // Native-token output settlement is not supported in v1; fall back to the AMM.
+        Currency currencyOut = params.zeroForOne ? key.currency1 : key.currency0;
+        if (Currency.unwrap(currencyOut) == address(0)) return false;
+
+        if (!_verifySolverSignature(key, params.zeroForOne, quote)) return false;
+
+        // The solver must beat the AMM spot price. Note: this compares against the
+        // marginal spot price and ignores price impact/fees (see roadmap: slippage handling).
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(key.toId());
+        uint256 priceX96 = FullMath.mulDiv(sqrtPriceX96, sqrtPriceX96, 1 << 96);
+        uint256 expectedOutAMM;
+        if (params.zeroForOne) {
+            // price = token1/token0 = (sqrtPriceX96^2) / 2^192
+            expectedOutAMM = FullMath.mulDiv(quote.amountIn, priceX96, 1 << 96);
+        } else {
+            expectedOutAMM = FullMath.mulDiv(quote.amountIn, 1 << 96, priceX96);
+        }
+
+        return quote.amountOut >= expectedOutAMM;
     }
 
     // TODO(Optimization): Replace OpenZeppelin ECDSA with raw inline assembly `ecrecover`
     // to reduce gas overhead by ~12,000 units on the hot path since this executes pre-swap.
-    function _verifySolverSignature(SolverQuote memory quote) internal returns (bool) {
-        if (block.timestamp > quote.deadline) revert SignatureExpired();
-        if (quote.nonce != solverNonces[quote.solver]) revert InvalidNonce();
+    /// @dev Returns false (instead of reverting) on any validation failure so the swap
+    ///      can fall back to AMM execution rather than bricking the user's transaction.
+    function _verifySolverSignature(PoolKey calldata key, bool zeroForOne, SolverQuote memory quote)
+        internal
+        returns (bool)
+    {
+        if (block.timestamp > quote.deadline) return false;
+        if (quote.nonce != solverNonces[quote.solver]) return false;
 
-        // Construct the message hash
-        bytes32 messageHash = keccak256(abi.encodePacked(quote.solver, quote.amountIn, quote.amountOut, quote.nonce, quote.deadline));
-        
-        // Recover the signer from the Ethereum signed message format
-        bytes32 ethSignedMessageHash = MessageHashUtils.toEthSignedMessageHash(messageHash);
-        address recoveredSigner = ECDSA.recover(ethSignedMessageHash, quote.signature);
-        
-        // Verify the recovered signer matches the solver and is authorized
-        bool isValid = recoveredSigner == quote.solver && isAuthorizedSolver[quote.solver];
-        
-        if (isValid) {
-            // Increment nonce only if signature is completely valid
-            solverNonces[quote.solver]++;
-        }
-        
-        return isValid;
+        // Bind the quote to this pool and direction to prevent cross-pool replay.
+        bytes32 messageHash = keccak256(
+            abi.encode(
+                key.toId(), zeroForOne, quote.solver, quote.amountIn, quote.amountOut, quote.nonce, quote.deadline
+            )
+        );
+
+        address recoveredSigner =
+            ECDSA.recover(MessageHashUtils.toEthSignedMessageHash(messageHash), quote.signature);
+
+        if (recoveredSigner != quote.solver || !isAuthorizedSolver[quote.solver]) return false;
+
+        // Increment nonce only once the signature is fully valid.
+        solverNonces[quote.solver]++;
+        return true;
     }
 
-    function _settleWithSolver(PoolKey calldata key, SwapParams calldata params, SolverQuote memory quote) internal {
-        // Determine currencies
+    /// @notice Settles a solver fill: the hook takes the user's input tokens (which the swapper
+    ///         replenishes when settling their own bill) and forwards them to the solver, then
+    ///         pulls the solver's output tokens and settles its own obligation.
+    function _settleWithSolver(PoolKey calldata key, SwapParams calldata params, SolverQuote memory quote)
+        internal
+    {
         Currency currencyIn = params.zeroForOne ? key.currency0 : key.currency1;
         Currency currencyOut = params.zeroForOne ? key.currency1 : key.currency0;
 
-        // If amountSpecified is negative, it's exactIn (user pays amountSpecified).
-        uint256 amountIn = params.amountSpecified < 0 ? uint256(-params.amountSpecified) : quote.amountIn;
+        uint256 amountIn = quote.amountIn;
         uint256 amountOut = quote.amountOut;
 
-        // 1. Hook takes `amountIn` of currencyIn from PoolManager and gives it to the Solver.
-        // Since the PoolManager might not have the ERC20 tokens yet (as the router pays after swap),
-        // we mint ERC6909 claims to the solver which they can burn later.
-        poolManager.mint(quote.solver, currencyIn.toId(), amountIn);
+        // 1. The hook is owed `amountIn` of currencyIn (positive delta from the returned
+        //    hookDelta). Claim it from the PoolManager — the swapper's own settlement
+        //    replenishes the pool — and forward it to the solver as payment.
+        //    Note: this transiently fronts pool reserves; the pool must hold >= amountIn
+        //    of currencyIn at this point (true for any pool with live liquidity).
+        poolManager.take(currencyIn, quote.solver, amountIn);
 
-        // 2. Hook pulls `amountOut` of currencyOut from Solver to PoolManager.
-        // The solver must have approved this hook contract.
-        // We use IERC20 to transfer the tokens.
-        if (Currency.unwrap(currencyOut) != address(0)) {
-            IERC20(Currency.unwrap(currencyOut)).transferFrom(quote.solver, address(poolManager), amountOut);
-        } else {
-            // For native ETH, solver would need to send ETH directly to the PoolManager.
-            // Simplified for v1.0.
-        }
-
-        // 3. Settle the currencyOut with the PoolManager to clear the hook's debit.
+        // 2. The hook owes `amountOut` of currencyOut. Pull it from the solver
+        //    (the solver must have approved this hook) and settle the obligation.
+        //    Note: sync() must come BEFORE the transfer so settle() measures the increase.
         poolManager.sync(currencyOut);
+        IERC20(Currency.unwrap(currencyOut)).transferFrom(quote.solver, address(poolManager), amountOut);
         poolManager.settle();
     }
 
-    function _checkLVRProtection(PoolKey calldata key) internal view {
+    /// @notice Reverts if the L2 pool price deviates too far from the L1 reference price,
+    ///         which indicates toxic arbitrage (LVR) in progress.
+    /// @dev The L1SLOAD read is a placeholder: on chains without the precompile the check
+    ///      is skipped. See the roadmap for a production implementation.
+    function _checkLVRProtection(PoolKey calldata key) internal {
         if (l1PoolAddress == address(0)) return;
 
         // Get the L2 AMM price
-        (uint160 sqrtPriceX96L2, , , ) = poolManager.getSlot0(key.toId());
+        (uint160 sqrtPriceX96L2,,,) = poolManager.getSlot0(key.toId());
 
-        // Read L1 spot price via L1SLOAD precompile (mocked call)
+        // Read L1 spot price via L1SLOAD precompile
         if (L1_SLOAD_PRECOMPILE.code.length > 0) {
-            (bool success, bytes memory data) = L1_SLOAD_PRECOMPILE.staticcall(
-                abi.encodePacked(l1PoolAddress, uint256(0))
-            );
+            (bool success, bytes memory data) =
+                L1_SLOAD_PRECOMPILE.staticcall(abi.encodePacked(l1PoolAddress, uint256(0)));
 
             if (success && data.length >= 32) {
                 uint256 slot0Data = abi.decode(data, (uint256));
                 // sqrtPriceX96 is the lowest 160 bits of Slot0
                 uint160 sqrtPriceX96L1 = uint160(slot0Data & 0x00FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF);
-                
-                // Check discrepancy
+
                 if (sqrtPriceX96L1 > 0 && sqrtPriceX96L2 > 0) {
-                    uint256 diff = sqrtPriceX96L1 > sqrtPriceX96L2 
-                        ? sqrtPriceX96L1 - sqrtPriceX96L2 
+                    uint256 diff = sqrtPriceX96L1 > sqrtPriceX96L2
+                        ? sqrtPriceX96L1 - sqrtPriceX96L2
                         : sqrtPriceX96L2 - sqrtPriceX96L1;
-                    
+
                     uint256 deviationBips = (diff * 10000) / sqrtPriceX96L2;
-                    
+
                     if (deviationBips > MAX_SQRT_PRICE_DEVIATION_BIPS) {
+                        emit LVRBlocked(key.toId(), sqrtPriceX96L2, sqrtPriceX96L1);
                         revert LVRAttackDetected();
                     }
                 }
@@ -225,65 +269,100 @@ contract IntentRFQHook is BaseHook, Ownable {
         }
     }
 
+    /// @notice Just-in-time liquidity: withdraws the swap's OUTPUT token from the lending
+    ///         protocol and adds it as single-sided liquidity just ahead of the price direction,
+    ///         so the fallback AMM swap traverses deeper reserves.
+    /// @dev Single-sided liquidity is only nonzero out of range on the appropriate side
+    ///      (an in-range single-sided position computes to zero liquidity), hence:
+    ///      - zeroForOne (price moves down): token1-only range BELOW the current price.
+    ///      - oneForZero (price moves up):   token0-only range ABOVE the current price.
+    ///      The position is owned by the hook (salt 0) and is permanent — use
+    ///      `sweepIdleLiquidity` to recycle it back into the lending protocol.
+    ///      Best-effort: never bricks the user's swap if JIT can't be placed.
     function _jitClawback(PoolKey calldata key, SwapParams calldata params) internal {
-        // Calculate exact token amount required for fallback
+        // Calculate exact token amount required for the fallback swap
         uint256 requiredAmount = uint256(params.amountSpecified > 0 ? params.amountSpecified : -params.amountSpecified);
-        
-        // Identify which token the AMM needs for the user's exact input/output
-        address tokenToWithdraw = params.zeroForOne ? Currency.unwrap(key.currency0) : Currency.unwrap(key.currency1);
-        
-        if (tokenToWithdraw != address(0)) {
-            // 1. Just-In-Time withdrawal from yield-generating protocol
-            aavePool.withdraw(tokenToWithdraw, requiredAmount, address(this));
-            
-            // 2. Add liquidity to the Uniswap V4 Pool dynamically
-            (uint160 sqrtPriceX96, int24 currentTick, , ) = poolManager.getSlot0(key.toId());
-            
-            // Snap to tick spacing for active range
-            int24 tickLower = (currentTick / key.tickSpacing) * key.tickSpacing;
-            if (currentTick < 0 && currentTick % key.tickSpacing != 0) tickLower -= key.tickSpacing;
-            int24 tickUpper = tickLower + key.tickSpacing;
 
-            uint160 sqrtRatioAX96 = TickMath.getSqrtPriceAtTick(tickLower);
-            uint160 sqrtRatioBX96 = TickMath.getSqrtPriceAtTick(tickUpper);
+        // JIT liquidity must deepen the OUTPUT side of the swap — that is what determines
+        // the execution price. (Withdrawing the input token would not improve the fill.)
+        bool zeroForOne = params.zeroForOne;
+        address tokenToWithdraw = zeroForOne ? Currency.unwrap(key.currency1) : Currency.unwrap(key.currency0);
+        if (tokenToWithdraw == address(0)) return;
 
-            uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
-                sqrtPriceX96,
-                sqrtRatioAX96,
-                sqrtRatioBX96,
-                params.zeroForOne ? requiredAmount : 0,
-                params.zeroForOne ? 0 : requiredAmount
-            );
+        int24 spacing = key.tickSpacing;
+        (uint160 sqrtPriceX96, int24 currentTick,,) = poolManager.getSlot0(key.toId());
 
-            poolManager.modifyLiquidity(
-                key,
-                ModifyLiquidityParams({
-                    tickLower: tickLower,
-                    tickUpper: tickUpper,
-                    liquidityDelta: int256(uint256(liquidity)),
-                    salt: bytes32(0)
-                }),
-                new bytes(0)
-            );
+        // Snap the current tick down to a usable boundary
+        int24 baseTick = (currentTick / spacing) * spacing;
+        if (currentTick < 0 && currentTick % spacing != 0) baseTick -= spacing;
 
-            // 3. Settle the newly added liquidity with the PoolManager
-            poolManager.sync(Currency.wrap(tokenToWithdraw));
-            IERC20(tokenToWithdraw).transfer(address(poolManager), requiredAmount);
-            poolManager.settle();
+        // Width of the JIT range (covers typical price impact of the incoming swap)
+        int24 width = 3 * spacing;
+        int24 tickLower;
+        int24 tickUpper;
+        if (zeroForOne) {
+            tickUpper = baseTick;
+            tickLower = baseTick - width;
+        } else {
+            tickLower = baseTick + spacing;
+            tickUpper = baseTick + spacing + width;
         }
+
+        // Best-effort: skip JIT rather than reverting the swap at extreme ticks.
+        if (tickLower < TickMath.MIN_TICK || tickUpper > TickMath.MAX_TICK) return;
+
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(tickLower),
+            TickMath.getSqrtPriceAtTick(tickUpper),
+            zeroForOne ? 0 : requiredAmount,
+            zeroForOne ? requiredAmount : 0
+        );
+        if (liquidity == 0) return;
+
+        // 1. Just-in-time withdrawal from the yield-generating protocol
+        aavePool.withdraw(tokenToWithdraw, requiredAmount, address(this));
+
+        // 2. Add output-side liquidity to the Uniswap V4 pool ahead of the price direction
+        poolManager.modifyLiquidity(
+            key,
+            ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: int256(uint256(liquidity)),
+                salt: bytes32(0)
+            }),
+            new bytes(0)
+        );
+
+        // 3. Settle the newly added liquidity with the PoolManager
+        //    Note: sync() must come BEFORE the transfer so settle() measures the increase.
+        poolManager.sync(Currency.wrap(tokenToWithdraw));
+        IERC20(tokenToWithdraw).transfer(address(poolManager), requiredAmount);
+        poolManager.settle();
+
+        emit JITLiquidityAdded(key.toId(), tokenToWithdraw, requiredAmount, liquidity);
     }
 
-    // Helper from v4-core
-    function toBeforeSwapDelta(int128 deltaUnspecified, int128 deltaSpecified) internal pure returns (BeforeSwapDelta delta) {
+    /// @dev Packs (specified, unspecified) with the specified delta in the high 128 bits,
+    ///      matching `BeforeSwapDeltaLibrary.getSpecifiedDelta/getUnspecifiedDelta`.
+    function toBeforeSwapDelta(int128 deltaSpecified, int128 deltaUnspecified)
+        internal
+        pure
+        returns (BeforeSwapDelta delta)
+    {
         assembly {
-            delta := or(shl(128, deltaUnspecified), and(deltaSpecified, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF))
+            delta := or(shl(128, deltaSpecified), and(deltaUnspecified, 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF))
         }
     }
 
-    /// @notice Permissionless function to sweep idle liquidity from the AMM into the yield-generating protocol
-    function sweepIdleLiquidity(PoolKey calldata key, int24 tickLower, int24 tickUpper, uint256 liquidityToRemove) external {
+    /// @notice Permissionless function to sweep idle liquidity from the AMM into the yield-generating protocol.
+    /// @dev Only touches positions owned by this hook (salt 0). Anyone may trigger the rebalance.
+    function sweepIdleLiquidity(PoolKey calldata key, int24 tickLower, int24 tickUpper, uint256 liquidityToRemove)
+        external
+    {
         // 1. Remove liquidity from Uniswap V4
-        (BalanceDelta delta, ) = poolManager.modifyLiquidity(
+        (BalanceDelta delta,) = poolManager.modifyLiquidity(
             key,
             ModifyLiquidityParams({
                 tickLower: tickLower,
@@ -295,12 +374,14 @@ contract IntentRFQHook is BaseHook, Ownable {
         );
 
         // 2. Take the withdrawn tokens from the PoolManager and supply to Aave
+        uint256 amount0;
+        uint256 amount1;
         if (delta.amount0() > 0) {
             address token0 = Currency.unwrap(key.currency0);
-            uint256 amount0 = uint256(uint128(delta.amount0()));
-            
+            amount0 = uint256(uint128(delta.amount0()));
+
             poolManager.take(key.currency0, address(this), amount0);
-            
+
             if (!isAaveApproved[token0]) {
                 IERC20(token0).approve(address(aavePool), type(uint256).max);
                 isAaveApproved[token0] = true;
@@ -310,15 +391,17 @@ contract IntentRFQHook is BaseHook, Ownable {
 
         if (delta.amount1() > 0) {
             address token1 = Currency.unwrap(key.currency1);
-            uint256 amount1 = uint256(uint128(delta.amount1()));
-            
+            amount1 = uint256(uint128(delta.amount1()));
+
             poolManager.take(key.currency1, address(this), amount1);
-            
+
             if (!isAaveApproved[token1]) {
                 IERC20(token1).approve(address(aavePool), type(uint256).max);
                 isAaveApproved[token1] = true;
             }
             aavePool.supply(token1, amount1, address(this), 0);
         }
+
+        emit IdleLiquiditySwept(key.toId(), amount0, amount1);
     }
 }

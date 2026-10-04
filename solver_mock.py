@@ -41,13 +41,14 @@ def generate_quote(intent):
     print(f"Solver offers: {amount_in} Token0 -> {better_amount_out} Token1")
     return amount_in, better_amount_out
 
-def sign_quote(amount_in, amount_out, nonce, deadline):
-    # Prepare payload matching SolverQuote struct
+def sign_quote(pool_id, zero_for_one, amount_in, amount_out, nonce, deadline):
+    # Prepare payload matching the on-chain signed message
     # struct SolverQuote { address solver; uint256 amountIn; uint256 amountOut; uint256 nonce; uint256 deadline; bytes signature; }
     
+    # The poolId and direction binding prevents cross-pool / cross-direction replay.
     message_hash = web3.keccak(eth_abi.encode(
-        ['address', 'uint256', 'uint256', 'uint256', 'uint256'],
-        [solver_account.address, amount_in, amount_out, nonce, deadline]
+        ['bytes32', 'bool', 'address', 'uint256', 'uint256', 'uint256', 'uint256'],
+        [pool_id, zero_for_one, solver_account.address, amount_in, amount_out, nonce, deadline]
     ))
     
     signable_message = encode_defunct(message_hash)
@@ -77,7 +78,9 @@ def run_solver_mock():
             amount_in, amount_out = generate_quote(intent)
             deadline = int(time.time()) + 300 # 5 minutes from now
             
-            signature = sign_quote(amount_in, amount_out, nonce, deadline)
+            pool_id = intent.get("pool_id", b"\x00" * 32)  # bytes32 PoolId for the target pool
+            zero_for_one = intent.get("zero_for_one", True)
+            signature = sign_quote(pool_id, zero_for_one, amount_in, amount_out, nonce, deadline)
             inject_transaction(amount_in, amount_out, nonce, deadline, signature)
             
             nonce += 1
