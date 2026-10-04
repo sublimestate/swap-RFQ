@@ -16,6 +16,7 @@ import {IERC20} from "forge-std/interfaces/IERC20.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 import {PoolId, PoolIdLibrary} from "v4-core/src/types/PoolId.sol";
 import {TickMath} from "v4-core/src/libraries/TickMath.sol";
+import {StateLibrary} from "v4-core/src/libraries/StateLibrary.sol";
 import {LiquidityAmounts} from "v4-periphery/src/libraries/LiquidityAmounts.sol";
 
 contract IntentRFQHookHarness is IntentRFQHook {
@@ -47,6 +48,9 @@ import {HookMiner} from "v4-periphery/src/utils/HookMiner.sol";
 import {Hooks} from "v4-core/src/libraries/Hooks.sol";
 
 contract IntentRFQHookTest is Test, Deployers {
+    using PoolIdLibrary for PoolKey;
+    using StateLibrary for IPoolManager;
+
     IntentRFQHookHarness public hook;
     MockAavePool public mockAavePool;
     address public mockL1Pool = address(0x456);
@@ -330,5 +334,45 @@ contract IntentRFQHookTest is Test, Deployers {
         );
 
         assertGt(token1.balanceOf(address(this)), userT1Before, "user received output tokens");
+    }
+
+    /// @notice sweepIdleLiquidity recycles a hook-owned JIT position back into the
+    ///         lending protocol. Regression test: the sweep must run inside the
+    ///         PoolManager's unlock context (modifyLiquidity/take revert outside it).
+    function test_SweepIdleLiquidity() public {
+        _addLiquidity(-60000, 60000, 100 ether, 100 ether);
+
+        IERC20 token1 = IERC20(Currency.unwrap(currency1));
+        token1.transfer(address(mockAavePool), 10 ether);
+
+        // Fallback swap creates the hook-owned JIT position (zeroForOne => token1-only,
+        // range below the pre-swap tick; pool is fresh at 1:1 so tick is 0).
+        swapRouter.swap(
+            poolKey,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(1 ether), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+
+        // Recompute the JIT range exactly like the hook does (pre-swap tick = 0).
+        int24 spacing = poolKey.tickSpacing;
+        int24 baseTick = 0;
+        int24 tickLower = baseTick - 3 * spacing;
+        int24 tickUpper = baseTick;
+        (uint128 jitLiquidity,,) =
+            manager.getPositionInfo(poolId, address(hook), tickLower, tickUpper, bytes32(0));
+        assertGt(jitLiquidity, 0, "JIT position exists");
+
+        uint256 aaveT1Before = token1.balanceOf(address(mockAavePool));
+
+        // Standalone call (no unlock context) — this reverted before the fix.
+        vm.expectEmit(true, false, false, false);
+        emit IntentRFQHook.IdleLiquiditySwept(poolId, 0, 0);
+        hook.sweepIdleLiquidity(poolKey, tickLower, tickUpper, jitLiquidity);
+
+        (uint128 liqAfter,,) =
+            manager.getPositionInfo(poolId, address(hook), tickLower, tickUpper, bytes32(0));
+        assertEq(liqAfter, 0, "JIT position fully removed");
+        assertGt(token1.balanceOf(address(mockAavePool)), aaveT1Before, "Aave received swept tokens");
     }
 }

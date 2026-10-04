@@ -358,16 +358,45 @@ contract IntentRFQHook is BaseHook, Ownable {
 
     /// @notice Permissionless function to sweep idle liquidity from the AMM into the yield-generating protocol.
     /// @dev Only touches positions owned by this hook (salt 0). Anyone may trigger the rebalance.
+    ///      Executes inside the PoolManager's unlock context (via unlockCallback below) because
+    ///      modifyLiquidity/take revert outside of it.
     function sweepIdleLiquidity(PoolKey calldata key, int24 tickLower, int24 tickUpper, uint256 liquidityToRemove)
         external
     {
+        poolManager.unlock(
+            abi.encode(
+                SweepCallbackData({
+                    key: key,
+                    tickLower: tickLower,
+                    tickUpper: tickUpper,
+                    liquidityToRemove: liquidityToRemove
+                })
+            )
+        );
+    }
+
+    struct SweepCallbackData {
+        PoolKey key;
+        int24 tickLower;
+        int24 tickUpper;
+        uint256 liquidityToRemove;
+    }
+
+    /// @notice Unlock callback for sweepIdleLiquidity: removes the hook-owned liquidity,
+    ///         takes the withdrawn tokens, and supplies them to the lending protocol.
+    /// @dev Only the PoolManager can invoke this, and only as a result of this hook
+    ///      calling poolManager.unlock from sweepIdleLiquidity.
+    function unlockCallback(bytes calldata data) external returns (bytes memory) {
+        require(msg.sender == address(poolManager), "only PoolManager");
+        SweepCallbackData memory d = abi.decode(data, (SweepCallbackData));
+
         // 1. Remove liquidity from Uniswap V4
         (BalanceDelta delta,) = poolManager.modifyLiquidity(
-            key,
+            d.key,
             ModifyLiquidityParams({
-                tickLower: tickLower,
-                tickUpper: tickUpper,
-                liquidityDelta: -int256(liquidityToRemove),
+                tickLower: d.tickLower,
+                tickUpper: d.tickUpper,
+                liquidityDelta: -int256(d.liquidityToRemove),
                 salt: bytes32(0)
             }),
             new bytes(0)
@@ -377,10 +406,10 @@ contract IntentRFQHook is BaseHook, Ownable {
         uint256 amount0;
         uint256 amount1;
         if (delta.amount0() > 0) {
-            address token0 = Currency.unwrap(key.currency0);
+            address token0 = Currency.unwrap(d.key.currency0);
             amount0 = uint256(uint128(delta.amount0()));
 
-            poolManager.take(key.currency0, address(this), amount0);
+            poolManager.take(d.key.currency0, address(this), amount0);
 
             if (!isAaveApproved[token0]) {
                 IERC20(token0).approve(address(aavePool), type(uint256).max);
@@ -390,10 +419,10 @@ contract IntentRFQHook is BaseHook, Ownable {
         }
 
         if (delta.amount1() > 0) {
-            address token1 = Currency.unwrap(key.currency1);
+            address token1 = Currency.unwrap(d.key.currency1);
             amount1 = uint256(uint128(delta.amount1()));
 
-            poolManager.take(key.currency1, address(this), amount1);
+            poolManager.take(d.key.currency1, address(this), amount1);
 
             if (!isAaveApproved[token1]) {
                 IERC20(token1).approve(address(aavePool), type(uint256).max);
@@ -402,6 +431,7 @@ contract IntentRFQHook is BaseHook, Ownable {
             aavePool.supply(token1, amount1, address(this), 0);
         }
 
-        emit IdleLiquiditySwept(key.toId(), amount0, amount1);
+        emit IdleLiquiditySwept(d.key.toId(), amount0, amount1);
+        return "";
     }
 }
